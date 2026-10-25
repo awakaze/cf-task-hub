@@ -1,0 +1,60 @@
+{
+  "name": "cf-task-hub",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Multi-tenant Cloudflare task hub for Baidu Netdisk and Bilibili VIP coupon tasks",
+  "scripts": {
+    "build": "vite build",
+    "test": "node --experimental-strip-types --test tests/*.test.mjs",
+    "typecheck": "npm run typecheck:worker && npm run typecheck:web",
+    "dev": "npm run build && wrangler dev",
+    "deploy": "npm run check && npm run db:remote && wrangler deploy",
+    "db:local": "wrangler d1 migrations apply DB --local",
+    "db:remote": "wrangler d1 migrations apply DB --remote",
+    "check": "npm run typecheck && npm test && npm run test:http && npm run build && npm run dry-run",
+    "typecheck:worker": "tsc --noEmit -p tsconfig.json",
+    "typecheck:web": "vue-tsc --noEmit -p tsconfig.web.json",
+    "test:http": "node --experimental-strip-types --test tests/integration/*.test.mjs",
+    "dry-run": "wrangler deploy --dry-run --outdir .wrangler/dry-run",
+    "secrets:init": "node scripts/generate-secrets.mjs",
+    "smoke:local": "node scripts/smoke-local.mjs",
+    "test:syntax": "node scripts/check-syntax.mjs",
+    "deploy:first": "npm run check && wrangler deploy && npm run db:remote"
+  },
+  "dependencies": {
+    "@simplewebauthn/server": "^13.3.0",
+    "hono": "^4.6.0",
+    "vue": "^3.5.0",
+    "@simplewebauthn/browser": "^13.3.0",
+    "zod": "4.6.7",
+    "@noble/hashes": "2.4.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "*",
+    "@vitejs/plugin-vue": "^5.2.0",
+    "typescript": "^5.9.0",
+    "vite": "^6.2.0",
+    "wrangler": "^4.45.0",
+    "vue-tsc": "^3.1.0"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "cloudflare": {
+    "bindings": {
+      "DATA_KEY": {
+        "description": "Base64-encoded 32-byte AES-GCM key, set after first deployment."
+      },
+      "BOOTSTRAP_TOKEN": {
+        "description": "One-time administrator setup token; 32+ random bytes."
+      },
+      "IDENTITY_KEY": {
+        "description": "Independent persistent base64url 32-byte HMAC key. Keep stable when DATA_KEY rotates."
+      }
+    }
+  },
+  "overrides": {
+    "undici": "7.30.1"
+  }
+}

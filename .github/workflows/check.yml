@@ -1,0 +1,39 @@
+name: Validate source and Cloudflare bundle
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      WRANGLER_SEND_METRICS: 'false'
+      CI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.22.1'
+      - name: Install locked dependencies
+        run: npm ci --ignore-scripts
+      - name: Worker and Vue typecheck, unit/HTTP tests, build, Wrangler dry-run
+        run: npm run check
+      - name: Real local workerd smoke (no account secrets)
+        run: npm run smoke:local
+      - name: Dependency vulnerability gate
+        run: npm audit --audit-level=high
+      - name: Save lockfile and local build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-artifacts
+          path: |
+            package-lock.json
+            web/dist
+            .wrangler/dry-run
+          if-no-files-found: ignore
+# This workflow never deploys to a Cloudflare account and has no cloud secrets.
+# The reviewed lockfile is committed; full runtime and tooling audits are gated.

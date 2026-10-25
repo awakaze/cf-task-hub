@@ -1,0 +1,14 @@
+node_modules/
+web/dist/
+.wrangler/
+.dev.vars
+.dev.vars.*
+secrets.local.json
+*.log
+.DS_Store
+coverage/
+
+secrets.*.json
+!secrets.example.json
+*.backup.sql
+.audit-artifacts/
