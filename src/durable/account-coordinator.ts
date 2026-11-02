@@ -227,7 +227,12 @@ export class AccountCoordinator implements DurableObject{
   const account=await this.env.DB.prepare('SELECT * FROM accounts WHERE id=? AND owner_user_id=?').bind(job.account_id,run.owner_user_id).first<any>();if(!account)return;
   const owner=await this.env.DB.prepare('SELECT status FROM users WHERE id=?').bind(run.owner_user_id).first<any>();
   const key='report:'+run.id;const saved=await this.state.storage.get<any>(key);
-  const readOnly=source==='reconcile'||stale||(run.status==='waiting_retry'&&(account.module_id==='bilibili-vip'||submitted(saved)));
+  // baidu-netdisk re-checks server state before every step (signed_today, tier
+  // received counts), so replaying it is idempotent-safe: retry and stale
+  // recovery rerun the full operation. Asset-moving modules keep read-only
+  // recovery and defer to explicit reconciliation or manual resolution.
+  const replaySafe=account.module_id==='baidu-netdisk';
+  const readOnly=source==='reconcile'||(!replaySafe&&(stale||(run.status==='waiting_retry'&&(account.module_id==='bilibili-vip'||submitted(saved)))));
   // A tombstone written before a failed D1 commit blocks all automatic work
   // until the administrator repeats the same resolution to finish persistence.
   if(await this.state.storage.get('settlement:'+run.id))return;

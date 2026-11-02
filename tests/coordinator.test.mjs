@@ -35,3 +35,28 @@ test('a confirmed expired session disables the account and its schedules',async(
 test('a transient HTTP failure does not incorrectly classify a session as expired',async()=>{const f=await setup();await withFetch(async()=>new Response('upstream unavailable',{status:503}),()=>invoke(f.do));assert.equal((await f.DB.prepare("SELECT enabled FROM accounts WHERE id='account'").first()).enabled,1);f.DB.close();});
 test('extra wallet growth is not accepted as proof of the expected exchange',async()=>{const f=await setup(),base=fake();let posts=0;await withFetch(async(input,init={})=>{const p=new URL(input).pathname;if(p.endsWith('/createOrder'))posts++;if(p.endsWith('/get_user_info'))return Response.json({code:0,data:{gold:posts?16000:10000,silver:0}});return base.request(input,init);},()=>invoke(f.do));assert.equal(posts,1);assert.equal((await f.DB.prepare("SELECT status FROM job_runs WHERE id='run'").first()).status,'waiting_retry');assert.ok(await f.storage.get('bili_pending_exchange'));f.DB.close();});
 test('manual reconciliation resolves response loss without a second transaction',async()=>{const f=await setup(),first=fake({responseLost:true,settles:false});await withFetch(first.request,()=>invoke(f.do));await f.DB.prepare("UPDATE job_runs SET status='waiting_verification' WHERE id='run'").run();let writes=0;await withFetch(async(input,init={})=>{if(init.method==='POST'){writes++;throw Error('no writes allowed');}if(new URL(input).pathname.endsWith('/nav'))return Response.json({code:0,data:{isLogin:true,mid:42,wallet:{coupon_balance:0,bcoin_balance:0}}});return Response.json({code:0,data:{gold:15000,silver:0}});},()=>invoke(f.do,'/reconcile'));assert.equal(writes,0);assert.equal((await f.DB.prepare("SELECT status FROM job_runs WHERE id='run'").first()).status,'succeeded');assert.equal(await f.storage.get('bili_pending_exchange'),undefined);f.DB.close();});
+test('baidu daily retry reruns the full signin instead of read-only reconciliation',async()=>{
+ const f=await fixture();
+ const credentials={cookie:'BDUSS=mock; STOKEN=mock',cuid:'mock-device'};
+ const identity=await verifiedIdentity(f.env,'baidu-netdisk',credentials,async input=>{
+  const u=new URL(input);if(u.pathname==='/api/loginStatus')return Response.json({errno:0,login_info:{uk:777}});
+  throw new Error('Unexpected identity request '+u.pathname);});
+ await account(f.DB,{module:'baidu-netdisk',fingerprint:identity.fingerprint,enc:await encrypt(f.env.DATA_KEY,'alice','account',credentials)});
+ await job(f.DB,{task:'baidu.daily'});await run(f.DB,{status:'waiting_retry'});
+ f.storage=memoryStorage();f.do=new AccountCoordinator({storage:f.storage},f.env);
+ let signed=0,signRequests=0;
+ const upstream=async input=>{const u=new URL(input);
+  if(u.pathname==='/api/loginStatus')return Response.json({errno:0,login_info:{uk:777}});
+  if(u.pathname==='/rest/2.0/membership/user')return Response.json({errno:0,level_info:{current_value:100}});
+  if(u.pathname==='/coins/taskcenter/signinlist')return Response.json({errno:0,data:{signed_today:signed,signin_days:1,reward_list:[{day:7,received:0,prize:[{}]}]}});
+  if(u.pathname==='/coins/taskcenter/tasklist')return Response.json({errno:0,result:{list:[{task_type:166,task_id:1,task_id_str:'1',task_from:'task_sys_daily'}]}});
+  if(u.pathname==='/coins/taskcenter/signin'){signRequests++;signed=1;return Response.json({errno:0});}
+  throw new Error('Unexpected request '+u.pathname);};
+ // Checkpoint mimics a first attempt that entered the operation phase before failing.
+ await f.storage.put({'report:run':{date:new Date(Date.now()+8*3600000).toISOString().slice(0,10),attempts:1,errors:[],ok:false,enabled:{pc:true,app:true,awards:true},steps:[{id:'pc',ok:true,attempt:1,phase:'operation_confirmed',state:'signed'},{id:'app',ok:false,attempt:1,phase:'before_operation',message:'百度业务失败（10117）'}]}});
+ await withFetch(upstream,()=>invoke(f.do));
+ assert.equal(signRequests,1,'retry must re-issue the signin, not fall back to read-only checks');
+ const r=await f.DB.prepare("SELECT status,result_json FROM job_runs WHERE id='run'").first();
+ assert.equal(r.status,'succeeded');
+ assert.equal(JSON.parse(r.result_json).details.report.attempts,2);
+ f.DB.close();});
