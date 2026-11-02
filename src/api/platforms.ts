@@ -95,6 +95,12 @@ async function jobStatements(env:Env,group:GroupRow,module:string,schedule:any,o
  return stmts;
 }
 function moduleTitle(module:string){return manifests.find(m=>m.id===module)?.title||module;}
+// Malformed cookies (newlines, control characters) used to escape checkIdentity
+// and surface as an opaque 500; give them the same actionable 422 treatment.
+function normalizedCookie(cookie:unknown):string{
+ try{return cookieInput(cookie);}
+ catch{throw new HttpError(422,'INVALID_COOKIE_FORMAT','Cookie 格式无效（为空、过长或包含换行等控制字符），请重新完整复制后重试');}
+}
 function cookieValue(cookie:string,name:string){return cookie.split(';').map(x=>x.trim()).find(x=>x.startsWith(name+'='))?.slice(name.length+1).trim()||'';}
 // The task-center APIs only require a device id (cuid) parameter and accept any
 // stable value; Baidu's passport QR login never issues BAIDUCUID, so generate
@@ -107,12 +113,18 @@ function withBaiduCuid(module:string,credentials:{cookie:string;cuid?:string;hea
 }
 // Upstream login checks fail with opaque errors today. Translate them into an
 // actionable message so a rejected Cookie is not reported as an internal error.
+// The upstream business code (e.g. Bilibili -352 risk control) is passed through
+// so a CF egress IP block is distinguishable from an invalid Cookie.
 async function checkIdentity(env:Env,module:string,credentials:Record<string,unknown>){
  try{return await verifiedIdentity(env,module,credentials);}
  catch(error){
+  // The error carries no Cookie or credential material; log for wrangler tail.
+  console.error(`[identity] ${module} upstream check failed:`,error);
   if(error instanceof SessionExpiredError)throw new HttpError(422,'UPSTREAM_SESSION_EXPIRED',`${moduleTitle(module)}登录态已失效，请重新登录后导入新的 Cookie`);
   const hint=module==='baidu-netdisk'?'BDUSS、STOKEN':'SESSDATA、bili_jct';
-  throw new HttpError(422,'UPSTREAM_IDENTITY_FAILED',`无法通过${moduleTitle(module)}登录态校验，请确认 Cookie 中的 ${hint} 完整有效，且账号仍在登录状态`);
+  const raw=error instanceof Error?error.message:'';
+  const reason=raw&&!/[\r\n]/.test(raw)?raw.slice(0,200):'';
+  throw new HttpError(422,'UPSTREAM_IDENTITY_FAILED',`无法通过${moduleTitle(module)}登录态校验，请确认 Cookie 中的 ${hint} 完整有效，且账号仍在登录状态${reason?`（原因：${reason}）`:''}`);
  }
 }
 async function prepareAccountBinding(env:Env,owner:string,module:string,label:string,credentials:{cookie:string;cuid?:string;headers?:Record<string,string>},group:GroupRow,targetId?:string,resumeJobs=false){
@@ -123,7 +135,7 @@ async function prepareAccountBinding(env:Env,owner:string,module:string,label:st
  const id=targetId||crypto.randomUUID();
  const schedule=jsonSafeParse<any>(group.schedule_json,null)||defaultSchedule();
  const jobs=!old||resumeJobs?await jobStatements(env,group,module,schedule,{...(!old?{newAccountId:id}:{}),onlyAccountId:id}):[];
- const cookie=cookieInput(credentials.cookie);
+ const cookie=normalizedCookie(credentials.cookie);
  const input=withBaiduCuid(module,{...credentials,cookie});
  const identity=await checkIdentity(env,module,input);
  if(old){if(old.identity_verified_at)assert(identity.fingerprint===old.fingerprint,409,'DIFFERENT_ACCOUNT','新凭据必须属于原来的上游账号');else await noUnsettled(env,owner,id);}
@@ -200,7 +212,7 @@ export function registerPlatformRoutes(app:App){
   let creds=String(old.credentials_enc),fp=String(old.fingerprint),verified=old.identity_verified_at;
   if(body.credentials){
    await requireRunning(c.env);await takeRate(c.env,'account-check:'+u.id,15,3600000);
-   const input=withBaiduCuid(module,{...body.credentials,cookie:cookieInput(body.credentials.cookie)});
+   const input=withBaiduCuid(module,{...body.credentials,cookie:normalizedCookie(body.credentials.cookie)});
    const identity=await checkIdentity(c.env,module,input);
    if(verified)assert(identity.fingerprint===fp,409,'DIFFERENT_ACCOUNT','New credentials must belong to the same upstream account');
    else await noUnsettled(c.env,u.id,id);

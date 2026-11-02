@@ -3,7 +3,7 @@ const MAIN_ORIGIN = 'https://api.bilibili.com';
 const LIVE_ORIGIN = 'https://api.live.bilibili.com';
 const VIP_REFERER = 'https://account.bilibili.com/';
 const LIVE_REFERER = 'https://live.bilibili.com/';
-const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36 Edg/156.0.0.0';
 
 // B站 nav.wallet.coupon_balance 是 B 币券面值余额（以 B 币为单位），不是券张数。
 // 每张常见的 5B 币券会令余额增加 5；旧版兑换实现使用每 1 B 币对应 1000 金瓜子。

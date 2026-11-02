@@ -284,10 +284,15 @@ export class AccountCoordinator implements DurableObject{
    if(!module||!module.manifest.tasks.some(t=>t.key===job.task_key))result={status:'failed',summary:'Unknown module or task'};
    else result=readOnly?await module.reconcile(ctx):await module.run(ctx);
   }catch(error){
+   // Surface the real upstream failure (e.g. Bilibili -352 risk control) for
+   // wrangler tail; the message carries no Cookie or credential material.
+   console.error(`[coordinator] ${run.id} task failed:`,error);
    if(error instanceof SessionExpiredError){await this.env.DB.batch([this.env.DB.prepare('UPDATE accounts SET enabled=0 WHERE id=?').bind(account.id),this.env.DB.prepare('UPDATE jobs SET enabled=0 WHERE account_id=?').bind(account.id)]);}
    const checkpoint=await this.state.storage.get<any>(key);
    const mayHaveSubmitted=submitted(checkpoint);
-   result={status:mayHaveSubmitted?'waiting_verification':'failed',summary:mayHaveSubmitted?'External operation may have been submitted; review required':error instanceof SessionExpiredError?'Platform session expired. Account and schedules paused; update credentials and re-enable.':'Account check or task request failed; no successful completion confirmed',details:{report:checkpoint||null}};
+   const raw=error instanceof Error?error.message:'';
+   const reason=raw&&!/[\r\n]/.test(raw)?raw.slice(0,800):'';
+   result={status:mayHaveSubmitted?'waiting_verification':'failed',summary:mayHaveSubmitted?'External operation may have been submitted; review required':error instanceof SessionExpiredError?'Platform session expired. Account and schedules paused; update credentials and re-enable.':'Account check or task request failed; no successful completion confirmed'+(reason?`（原因：${reason}）`:''),details:{report:checkpoint||null}};
   }
   if(job.task_key==='bili.exchange'&&result.status==='succeeded'){
    const report=await this.state.storage.get<any>(key);
