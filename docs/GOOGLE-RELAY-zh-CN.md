@@ -56,6 +56,7 @@ Google 中转不是全局 `fetch` 替换，也不会拦截通知服务、内部 
 - 百度账号只读探测；
 - 百度签到任务；
 - 百度扫码登录的二维码开始、轮询、Cookie 交换；
+- B 站扫码生成与轮询、Cookie 自动续期与确认；
 - B 站账号身份校验；
 - B 站只读探测；
 - B 站任务执行与只读复核。
@@ -77,7 +78,7 @@ Google 中转不是全局 `fetch` 替换，也不会拦截通知服务、内部 
 | `src/core/upstream-fetch.ts` | 统一开关选择器；默认返回原生 `fetch` |
 | `src/core/types.ts` | 增加 3 个可选环境变量类型 |
 | `src/api/user.ts` | 创建、更新、探测账号时注入上游 fetcher |
-| `src/api/platforms.ts` | 平台身份校验、探测和百度扫码流程注入 fetcher |
+| `src/api/platforms.ts` | 平台身份校验、探测及两个平台扫码流程注入 fetcher |
 | `src/durable/account-coordinator.ts` | 任务执行和只读复核注入 fetcher |
 | `src/modules/baidu-netdisk/adapter.ts` | 百度探测函数支持可选 fetcher |
 | `src/modules/bilibili/adapter.ts` | B 站探测函数支持可选 fetcher |

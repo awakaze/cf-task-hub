@@ -15,6 +15,7 @@ The selector is used for:
 - Baidu Netdisk account identity checks.
 - Baidu Netdisk account probes and task execution.
 - Baidu QR login start, poll, and cookie exchange requests.
+- Bilibili QR login generation and polling, Cookie refresh and confirmation.
 - Bilibili account identity checks.
 - Bilibili account probes, task execution, and read-only reconciliation.
 
@@ -36,7 +37,7 @@ This boundary is intentional: the Google integration is not a global monkey patc
 | `src/core/upstream-fetch.ts` | Feature-flag selector; native fetch is the default |
 | `src/core/types.ts` | Optional relay environment bindings |
 | `src/api/user.ts` | Pass selected fetcher into identity checks and account probes |
-| `src/api/platforms.ts` | Pass selected fetcher into identity checks, probes, and Baidu QR flow |
+| `src/api/platforms.ts` | Pass selected fetcher into identity checks, probes, and both platforms’ QR flows |
 | `src/durable/account-coordinator.ts` | Pass selected fetcher into execution and reconciliation contexts |
 | `src/modules/baidu-netdisk/adapter.ts` | Probe accepts an optional injected fetcher |
 | `src/modules/bilibili/adapter.ts` | Probe accepts an optional injected fetcher |

@@ -36,7 +36,7 @@
 
 ## Cloudflare部署边界
 
-本次没有登录或修改部署者的Cloudflare账户。必须自己核对Workers Free/Workers Paid，不能只看域名Free标识。付费预算告警不是硬封顶；免费额度耗尽主要导致拒绝服务。
+部署者需要自行核对Workers Free/Workers Paid，不能只看域名Free标识。付费预算告警不是硬封顶；免费额度耗尽主要导致拒绝服务。
 
 自用/熟人使用优先把整个Worker放到Access白名单后面；自定义域、workers.dev和预览入口必须同时覆盖。不用的入口应关闭并在部署配置中保留关闭状态。公开服务应在进入Worker之前配置可用的WAF/限速规则；如接入Turnstile，必须服务端验证，不能只加前端按钮。项目没有假装已经替你启用这些账户级设置。
 
@@ -54,7 +54,9 @@
 
 ## 上游网络与未知结果
 
-百度二维码只允许显式官方HTTPS主机，每跳检查目标和端口。图片按流限制200KB，并限制图片类型和签名。Cookie按Domain/Path/Secure/过期时间隔离，Passport的host-only STOKEN不作为网盘STOKEN；不会把Cookie转发给任意上游redirect。
+百度二维码只允许显式官方HTTPS主机，每跳检查目标和端口。图片按流限制200KB，并限制图片类型和签名。扫码 Cookie jar 在服务端加密保存，并绑定用户及会话 ID；按 Domain/Path/Secure/过期时间选择 Cookie，不将 passport 专属 STOKEN 作为网盘 STOKEN。收齐凭据后停止跳转，仍须身份验证后才能绑定。B 站 Cookie、续期令牌和恢复状态也只存于加密凭据；D1 协调表不存令牌。详见 [百度登录](BAIDU-AUTH.md) 和 [B 站登录](BILIBILI-AUTH.md)。
+
+当前数据库版本为 9，必须应用所有迁移再开放业务 API。临时扫码诊断默认关闭，不记录 Cookie 值、票据、URL 查询串或响应正文。本地 cookie 文件、secrets.local.json、.dev.vars、.wrangler 和诊断产物不进入 Git。
 
 Webhook要求管理员批准的HTTPS域名，限制请求头，DNS预检查并禁止自动跳转。DNS预检查不是连接地址固定；只批准可信且受控的域名，不批准任意用户可改DNS的目标。通知内容也不得包含原始Cookie或根密钥。
 
@@ -72,7 +74,7 @@ Webhook要求管理员批准的HTTPS域名，限制请求头，DNS预检查并�
 
 ## 依赖与发布
 
-使用package-lock.json固定依赖。Zod已升级到4.6.7；开发工具链undici覆盖到7.30.1；全量审计结果随本包附上。不得为消除审计输出直接执行不加审查的audit fix --force。
+使用package-lock.json固定依赖。Zod已升级到4.6.7；开发工具链undici覆盖到7.30.1；依赖审计应结合当前 lockfile 单独运行并检查，不把历史审计结果视为当前安全保证。不得为消除审计输出直接执行不加审查的audit fix --force。
 
 OWASP密码存储依据：https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html
 Zod公告：https://github.com/advisories/GHSA-mrhx-c7xc-m3w5

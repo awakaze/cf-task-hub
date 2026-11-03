@@ -7,6 +7,8 @@
 - src/core/registry.ts：集中注册模块 manifest、配置字段、执行、只读探测、复核函数。
 - src/modules/<module>/adapter.ts：把原项目结果映射为 succeeded / already_done / failed / waiting_verification。
 - src/core/identity.ts：只读平台身份探测；用户声明的 UID 或 Cookie 文本本身不可信。
+- src/core/bilibili-auth.ts / bilibili-sessions.ts：B 站二维码、续期协议与加密凭据的中断恢复；通过原账号协调器串行处理。
+- src/core/run-presentation.ts：按已存证据生成状态中文名、原因、分项结果、进度及下一步提示；列表不返回完整报告。
 - src/durable/account-coordinator.ts：同账号串行化、检查点与任务恢复；B站待兑换保护仍有专项逻辑。
 - 前端由 manifest.configSchema 展示基础 boolean/integer 设置字段；后端 validateModuleSettings 再次验证。
 
@@ -36,6 +38,14 @@
 - 所有凭据更新均先只读确认平台真实身份，更新现有账号不能变更平台 UID。组、账号、计划、审计及扫码消费在事务中提交。
 - 结果可确定时采用只读 `reconcile`；缺乏证据时保留 `waiting_verification`。新增资金型模块需要独立证据模型，不能复用不匹配的余额推断。幂等安全模块（每步执行前重查服务端状态，如百度签到）例外：自动重试与卡死恢复均完整重跑，只有显式"重新核验"仍是只读。
 - 组通知 `null` 表示继承用户默认策略；显式空渠道表示关闭，不得把用户的关闭选择自动迁移为开启。
-- 网络端点白名单、响应上限、取消/超时和 Cookie 域隔离属于适配器边界。新增重定向必须逐跳验证目标，不转发跨域凭据。
+- 网络端点白名单、响应上限、取消/超时和 Cookie 域隔离属于适配器边界。新增重定向必须逐跳验证目标，按目标作用域重新选择 Cookie，禁止盲目转发整份凭据。
 - 模块禁用后仍保留历史数据和凭据管理入口，但执行、扫码和上游调用必须检查模块及维护开关。
 - 管理员人工结案只能记录经证据核实的既有结果，必须保留不可变证据和 DO 防重放记录，不触发原任务重跑。
+
+## 结果与升级兼容
+
+适配器继续返回原有 TaskResult 状态。`already_done` 对应“检查完成”；`succeeded` 对应“执行成功”，不重写旧状态。新增模块应为 `run-presentation.ts` 提供明确、有限的证据映射，不将缺失数值补为 0，也不能把“暂无可领取”推断为“已领取”。详见 [运行结果说明](RUN-RESULTS.md)。
+
+新写入的等待重试报告保存预计 `retry_at`，并与 DO 实际安排时间保持一致；维护暂停可能顺延，旧报告没有该字段时不编造时间。账号失效和续期暂不可用使用不同原因，未知资产结果保留只读核对入口。
+
+B 站会话表位于迁移 `0009_bilibili_sessions.sql`，readiness 要求 schema_version=9。登录状态维护可以复用原队列与 DO，但不绕过模块、维护、用户冻结和账号暂停开关。
