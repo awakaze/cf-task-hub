@@ -8,6 +8,7 @@ import {mutationGuard} from '../core/mutation-guard.ts';
 import {manifests,moduleDefinition,validateModuleSettings} from '../core/registry.ts';
 import {validateSchedule,nextSchedule,BEIJING} from '../core/time.ts';
 import {verifiedIdentity,SessionExpiredError} from '../core/identity.ts';
+import {upstreamFetch} from '../core/upstream-fetch.ts';
 import {cookieInput,boundedJson,boundedText} from '../core/network.ts';
 import {requireRunning,takeRate,noUnsettled,sanitizeReport} from '../core/safety.ts';
 import {decryptConfig} from '../core/secrets.ts';
@@ -115,8 +116,8 @@ function withBaiduCuid(module:string,credentials:{cookie:string;cuid?:string;hea
 // actionable message so a rejected Cookie is not reported as an internal error.
 // The upstream business code (e.g. Bilibili -352 risk control) is passed through
 // so a CF egress IP block is distinguishable from an invalid Cookie.
-async function checkIdentity(env:Env,module:string,credentials:Record<string,unknown>){
- try{return await verifiedIdentity(env,module,credentials);}
+async function checkIdentity(env:Env,module:string,credentials:Record<string,unknown>,fetcher:typeof fetch=upstreamFetch(env)){
+ try{return await verifiedIdentity(env,module,credentials,fetcher);}
  catch(error){
   // The error carries no Cookie or credential material; log for wrangler tail.
   console.error(`[identity] ${module} upstream check failed:`,error);
@@ -256,7 +257,7 @@ export function registerPlatformRoutes(app:App){
   if(account.identity_verified_at)assert(identity.fingerprint===account.fingerprint,409,'DIFFERENT_ACCOUNT','账号身份不一致');
   else{await noUnsettled(c.env,u.id,String(account.id));await c.env.DB.prepare('UPDATE accounts SET fingerprint=?,identity_verified_at=? WHERE id=? AND owner_user_id=?').bind(identity.fingerprint,Date.now(),account.id,u.id).run();}
   const moduleDef=moduleDefinition(module);assert(moduleDef,400,'INVALID_MODULE','未知模块');
-  const result=await moduleDef.probe(credentials,jsonSafeParse<Record<string,unknown>>(String(account.config_json),{}));
+  const result=await moduleDef.probe(credentials,jsonSafeParse<Record<string,unknown>>(String(account.config_json),{}),upstreamFetch(c.env));
   return c.json({ok:true,readOnly:true,checked_at:Date.now(),result:sanitizeReport(result)});
  });
  app.post('/api/v1/platforms/:module/run',async c=>{
@@ -299,7 +300,7 @@ export function registerPlatformRoutes(app:App){
   await takeRate(c.env,'qr-start:'+u.id,10,3600000);
   if(body.accountId){const a=await getAccount(c.env,body.accountId,u.id);assert(a.module_id===module,404,'NOT_FOUND','账号不属于该平台');}
   else await checkLimit(c.env,u.id,'accounts',(await quotas(c.env,u.id)).max_accounts);
-  const qr=await baiduQrStart();
+  const qr=await baiduQrStart(upstreamFetch(c.env));
   const now=Date.now(),id=crypto.randomUUID(),expires=now+180000;
   await c.env.DB.batch([
    c.env.DB.prepare('DELETE FROM login_challenges WHERE id IN(SELECT id FROM login_challenges WHERE expires_at<? AND (lease_until IS NULL OR lease_until<?) LIMIT 100)').bind(now,now),
@@ -334,12 +335,12 @@ export function registerPlatformRoutes(app:App){
   if(!claimed)return c.json({status:'pending',retry_after_ms:2500});
   let processing=false;
   try{
-   const state=await baiduQrPoll(String(challenge.sign));
+   const state=await baiduQrPoll(String(challenge.sign),upstreamFetch(c.env));
    if(!(state.status===0&&state.v))return c.json({status:state.status===1?'scanned':'pending',retry_after_ms:2500});
    await requireRunning(c.env);await moduleEnabled(c.env,module);
    const moved=await c.env.DB.prepare("UPDATE login_challenges SET status='processing' WHERE id=? AND lease_token=? AND status='pending' RETURNING id").bind(challenge.id,lease).first();
    assert(moved,409,'QR_STATE_CHANGED','扫码会话状态已变化，请重新生成');processing=true;
-   const cookie=await baiduQrCookie(state.v);
+   const cookie=await baiduQrCookie(state.v,upstreamFetch(c.env));
    const group=await ensureGroup(c.env,u.id,module);
    const target=challenge.target_account_id?await getAccount(c.env,String(challenge.target_account_id),u.id):null;
    const account=await prepareAccountBinding(c.env,u.id,module,target?String(target.label):body.label,{cookie},group,challenge.target_account_id||undefined,!!challenge.resume_jobs);

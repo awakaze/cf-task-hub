@@ -9,10 +9,9 @@ import {manifests,taskMatches,taskManifest,moduleDefinition,validateModuleSettin
 import {DEFAULT_POLICY} from '../core/notifications.ts';
 import {validateSchedule,nextSchedule,validZone} from '../core/time.ts';
 import {verifiedIdentity} from '../core/identity.ts';
+import {upstreamFetch} from '../core/upstream-fetch.ts';
 import {cookieInput} from '../core/network.ts';
 import {noUnsettled,requireRunning,takeRate,sanitizeReport} from '../core/safety.ts';
-import {probeBaidu} from '../modules/baidu-netdisk/adapter.ts';
-import {probeBili} from '../modules/bilibili/adapter.ts';
 import {validateChannelInput,sendTestNotification} from '../providers/notify.ts';
 import {queueRun} from '../core/scheduler.ts';
 import {manualRunUsage} from '../core/run-batch.ts';
@@ -63,7 +62,7 @@ export function registerUserRoutes(app:App){
   const config=await checkAccountConfig(body.module_id,body.config),id=crypto.randomUUID();
   await requireRunning(c.env);await takeRate(c.env,'account-check:'+u.id,15,3600000);
   const cookie=cookieInput(body.credentials.cookie);
-  const identity=await verifiedIdentity(c.env,body.module_id,{...body.credentials,cookie});
+  const fetcher=upstreamFetch(c.env);const identity=await verifiedIdentity(c.env,body.module_id,{...body.credentials,cookie},fetcher);
   const fp=identity.fingerprint;
   const encrypted=await encrypt(c.env.DATA_KEY,u.id,id,{...body.credentials,cookie,externalId:identity.externalId});
   try{await c.env.DB.prepare('INSERT INTO accounts(id,owner_user_id,module_id,label,fingerprint,credentials_enc,config_json,enabled,created_at,updated_at,identity_verified_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)').bind(id,u.id,body.module_id,body.label,fp,encrypted,JSON.stringify(config),1,Date.now(),Date.now(),Date.now()).run();}
@@ -78,7 +77,7 @@ export function registerUserRoutes(app:App){
   if(body.credentials){
    await requireRunning(c.env);await takeRate(c.env,'account-check:'+u.id,15,3600000);
    const input={...body.credentials,cookie:cookieInput(body.credentials.cookie)};
-   const identity=await verifiedIdentity(c.env,module,input);
+   const identity=await verifiedIdentity(c.env,module,input,upstreamFetch(c.env));
    if(verified)assert(identity.fingerprint===fp,409,'DIFFERENT_ACCOUNT','New credentials must belong to the same upstream account');
    else await noUnsettled(c.env,u.id,id);
    fp=identity.fingerprint;creds=await encrypt(c.env.DATA_KEY,u.id,id,{...input,externalId:identity.externalId});verified=Date.now();
@@ -97,11 +96,11 @@ export function registerUserRoutes(app:App){
  });
  app.post('/api/v1/accounts/:id/probe',async c=>{
   const u=user(c);await requireRunning(c.env);await takeRate(c.env,'account-check:'+u.id,15,3600000);const acc=await getAccount(c.env,c.req.param('id'),u.id);const creds=await decryptConfig<Record<string,unknown>>(c.env,u.id,String(acc.id),String(acc.credentials_enc));
-  const identity=await verifiedIdentity(c.env,String(acc.module_id),creds);
+  const fetcher=upstreamFetch(c.env);const identity=await verifiedIdentity(c.env,String(acc.module_id),creds,fetcher);
   if(acc.identity_verified_at)assert(identity.fingerprint===acc.fingerprint,409,'DIFFERENT_ACCOUNT','Upstream identity mismatch');
   else{await noUnsettled(c.env,u.id,String(acc.id));await c.env.DB.prepare('UPDATE accounts SET fingerprint=?,identity_verified_at=? WHERE id=? AND owner_user_id=?').bind(identity.fingerprint,Date.now(),acc.id,u.id).run();}
   const config=jsonSafeParse<Record<string,unknown>>(String(acc.config_json),{});
-  const module=moduleDefinition(String(acc.module_id));assert(module,400,'INVALID_MODULE','Unknown module');const result=await module.probe(creds,config);
+  const module=moduleDefinition(String(acc.module_id));assert(module,400,'INVALID_MODULE','Unknown module');const result=await module.probe(creds,config,fetcher);
   return c.json({ok:true,readOnly:true,checked_at:Date.now(),result:sanitizeReport(result)});
  });
  app.get('/api/v1/jobs',async c=>{

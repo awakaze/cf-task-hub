@@ -13,6 +13,10 @@ export interface Env {
   DLQ_NAME?: string;
   API_PAUSED?: string;
   BACKGROUND_PAUSED?: string;
+  /** Optional outbound relay; disabled unless exactly 'true'. */
+  GOOGLE_RELAY_ENABLED?: string;
+  GOOGLE_RELAY_URL?: string;
+  GOOGLE_RELAY_HMAC_SECRET?: string;
 }
 export type User = {id:string;username:string;role:'admin'|'user';status:'active'|'suspended'|'deleted';timezone:string;created_at:number;password_hash?:string|null};
 export type CurrentUser = User & {sessionId:string;csrfHash:string;csrfToken?:string;recovery_password_reset_allowed?:boolean;recovery_password_reset_expires_at?:number|null};

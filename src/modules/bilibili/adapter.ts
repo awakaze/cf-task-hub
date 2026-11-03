@@ -14,7 +14,7 @@ export async function executeBili(ctx:{taskKey:string;credentials:Record<string,
  const pending=ctx.taskKey==='bili.exchange'?['request_started','pending_verification','unverified'].includes(exchangeState):['request_started','pending_verification','unverified'].includes(claimState);
  return {status:pending?'waiting_verification':report.ok?(ctx.taskKey==='bili.vip_claim'&&claimState==='not_available'||ctx.taskKey==='bili.exchange'&&exchangeState==='no_coupons'?'already_done':'succeeded'):'failed',summary:pending?'权益或电池余额未能核实，已暂停重复提交':report.ok?'B站权益任务完成':'B站权益任务存在异常',details:{report}};
 }
-export async function probeBili(credentials:Record<string,unknown>,settings:Record<string,unknown>){return readStatus(new BiliClient(config(credentials,settings,'bili.vip_claim')));}
+export async function probeBili(credentials:Record<string,unknown>,settings:Record<string,unknown>,fetcher:typeof fetch=fetch){return readStatus(new BiliClient(config(credentials,settings,'bili.vip_claim'),fetcher));}
 
 export async function reconcileBili(ctx:{taskKey:string;credentials:Record<string,unknown>;settings:Record<string,unknown>;load:()=>Promise<any>;save:(r:any)=>Promise<void>;fetcher?:typeof fetch}):Promise<TaskResult>{
  const report=await ctx.load();

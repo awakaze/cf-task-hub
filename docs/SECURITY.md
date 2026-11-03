@@ -79,3 +79,13 @@ Zod公告：https://github.com/advisories/GHSA-mrhx-c7xc-m3w5
 Undici公告：https://github.com/nodejs/undici/security/advisories/GHSA-xjj6-f33q-929c
 
 任何未来依赖升级或新增模块都应重新运行类型检查、回归、构建、workerd smoke和依赖审计。发布材料只描述实际已执行的验证，不承诺永远没有漏洞。
+
+## Optional Google Apps Script HTTPS relay
+
+The optional Google relay is disabled unless `GOOGLE_RELAY_ENABLED` is exactly `true`. When disabled, platform modules continue to use native Cloudflare `fetch`. The relay is injected only into platform identity checks, platform probes, Baidu QR requests, and Baidu/Bilibili module execution/reconciliation. It is not a global fetch override and does not route notification providers or internal Cloudflare service bindings.
+
+When enabled, Worker-held platform cookies and API keys are transmitted to Apps Script as part of the individual upstream request. Apps Script can read these values while forwarding them; the code does not persist them in Script Properties or write them to logs. The HMAC secret is stored separately in a Cloudflare Worker Secret and Google Script Property. Keep Apps Script editor access restricted.
+
+The relay accepts HTTPS only and rejects obvious IP-literal/private/test hostnames, but hostname string checks are not complete SSRF protection and do not fully prevent DNS rebinding. Do not expose a public Worker endpoint that lets unauthenticated callers choose arbitrary target URLs. The relay buffers bodies and has explicit size limits; it is not suitable for WebSocket, TCP, UDP, real-time media, or large files. Google egress IPs are shared/dynamic and do not guarantee that upstream risk controls will accept a request.
+
+See [Google relay deployment and rollback](GOOGLE-RELAY.md) for configuration, protocol, limits, testing, and operational steps.

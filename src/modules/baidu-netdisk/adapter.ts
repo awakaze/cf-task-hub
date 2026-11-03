@@ -11,7 +11,7 @@ export async function executeBaidu(ctx:{credentials:Record<string,unknown>;setti
  await runAttempt(report,client,config,()=>ctx.save(report));await ctx.save(report);
  return {status:report.ok?(report.steps.length>0&&report.steps.every((s:any)=>['already_signed','already_claimed'].includes(s.state))?'already_done':'succeeded'):'failed',summary:report.ok?'PC / App 签到及奖励流程完成':'百度签到部分操作失败或待复核',details:{report}};
 }
-export async function probeBaidu(credentials:Record<string,unknown>,setting:Record<string,unknown>){const config=baiduConfig(credentials,setting);return readStatus(new BaiduClient(config),config);}
+export async function probeBaidu(credentials:Record<string,unknown>,setting:Record<string,unknown>,fetcher:typeof fetch=fetch){const config=baiduConfig(credentials,setting);return readStatus(new BaiduClient(config,fetcher),config);}
 
 // Only the read-only membership query and signinlist endpoints are used here.
 // Current App/award state can confirm today's goal, while an uncertain PC

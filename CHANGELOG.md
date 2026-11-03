@@ -41,3 +41,11 @@
 | 每用户自动运行 | 每 UTC 自然日 10 次 |
 | 每用户通知投递 | 每 UTC 自然日 20 条 |
 | 全站每日运行 / 通知 | 500 / 500（管理员可调） |
+
+
+## Optional Google HTTPS relay
+
+- Added an isolated upstream fetch adapter with an explicit opt-in flag. The default is disabled and retains native Cloudflare fetch behavior.
+- Routed platform identity checks, Baidu QR login, Baidu Netdisk API calls, and Bilibili API calls through the selector.
+- Added Google Apps Script HMAC-authenticated relay source and deployment documentation.
+- No database migration, public relay route, frontend change, Cron change, Queue change, or business-task logic change.

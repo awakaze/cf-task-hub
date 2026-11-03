@@ -5,6 +5,7 @@ import {jsonSafeParse} from '../core/response.ts';
 import {setting} from '../core/db.ts';
 import {sanitizeReport} from '../core/safety.ts';
 import {verifiedIdentity,SessionExpiredError} from '../core/identity.ts';
+import {upstreamFetch} from '../core/upstream-fetch.ts';
 function submitted(report:any):boolean{return !!(report?.exchange?.requestedAt||report?.claim?.requestedAt||report?.steps?.some((s:any)=>['before_operation','operation_confirmed'].includes(s.phase)));}
 const EVIDENCE_RETENTION=365*86400000;
 function evidenceKey(kind:'report'|'settlement',expiresAt:number,id:string){return kind+'-expiry:'+String(expiresAt).padStart(16,'0')+':'+id;}
@@ -272,8 +273,9 @@ export class AccountCoordinator implements DurableObject{
   const settings=jsonSafeParse<Record<string,unknown>>(account.config_json,{});
   try{
    const credentials=await decryptConfig<Record<string,unknown>>(this.env,run.owner_user_id,account.id,account.credentials_enc);
-   if(!readOnly){const identity=await verifiedIdentity(this.env,account.module_id,credentials);if(identity.fingerprint!==account.fingerprint)throw new Error('Account identity changed');}
-   const ctx={taskKey:job.task_key,credentials,settings,load:()=>this.state.storage.get(key),save:async(report:any)=>{
+   const fetcher=upstreamFetch(this.env);
+   if(!readOnly){const identity=await verifiedIdentity(this.env,account.module_id,credentials,fetcher);if(identity.fingerprint!==account.fingerprint)throw new Error('Account identity changed');}
+   const ctx={taskKey:job.task_key,credentials,settings,fetcher,load:()=>this.state.storage.get(key),save:async(report:any)=>{
     const expiresAt=Number(run.created_at)+EVIDENCE_RETENTION;
     const records:Record<string,unknown>={[key]:report,[evidenceKey('report',expiresAt,run.id)]:{runId:run.id,expiresAt}};
     if(job.task_key==='bili.exchange'&&report.exchange?.requestedAt&&report.exchange.state!=='confirmed')records.bili_pending_exchange={runId:run.id,at:Date.now()};

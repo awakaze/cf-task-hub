@@ -95,6 +95,12 @@ npx wrangler secret bulk secrets.local.json
 npm run deploy      # 检查 → 远程迁移 → 发布
 ```
 
+## 可选 Google HTTPS 中转（默认关闭）
+
+项目新增了与业务模块解耦的 Google Apps Script HTTPS 中转适配器。默认 `GOOGLE_RELAY_ENABLED=false`，未启用时继续使用原生 Cloudflare `fetch()`，不会改变现有网络行为。启用方式、密钥配置、接入范围和限制见 [Google 中转部署说明](docs/GOOGLE-RELAY-zh-CN.md) / [English](docs/GOOGLE-RELAY.md)。
+
+该中转只覆盖百度 / B 站上游 API、身份检查与百度扫码流程；通知服务、D1、Durable Objects、队列、Cron 和站内请求不经过 Google。Google 端不持久化平台 Cookie / API Key，但转发时能读取本次请求凭据。此功能不是 TCP / UDP / WebSocket 隧道，也不保证第三方平台不再触发风控。
+
 ## 常用命令
 
 | 命令 | 用途 |
@@ -138,4 +144,4 @@ docs/            架构、模块、安全、升级与许可证
 
 - 百度网盘模块参考 `awakaze/cf-netdisk-signin`，B 站模块参考 `cf-bilibili-coupon-worker`。
 - 相关许可证见 [docs/LICENSE-baidu-netdisk.txt](docs/LICENSE-baidu-netdisk.txt) 与 [docs/LICENSE-bilibili-worker.txt](docs/LICENSE-bilibili-worker.txt)。
-- 其余文档：[模块说明](docs/MODULES.md)、[安全说明](docs/SECURITY.md)、[变更记录](CHANGELOG.md)。
+- 其余文档：[模块说明](docs/MODULES.md)、[安全说明](docs/SECURITY.md)、[Google 中转部署说明](docs/GOOGLE-RELAY-zh-CN.md) / [English](docs/GOOGLE-RELAY.md)、[变更记录](CHANGELOG.md)。
