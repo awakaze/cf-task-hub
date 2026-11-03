@@ -7,7 +7,7 @@ export type ModuleContext={taskKey:string;credentials:Record<string,unknown>;set
 const shared:ConfigField[]=[{key:'timeout_ms',title:'请求超时（毫秒）',type:'integer',default:15000,min:500,max:60000},{key:'retry_minutes',title:'失败重试间隔（分钟）',type:'integer',default:30,min:1,max:1440}];
 export const moduleDefinitions=[
  {manifest:{...baiduManifest,version:'0.1.0',credentialSchema:[{key:'cookie',type:'secret',required:true},{key:'cuid',type:'secret',required:false},{key:'headers',type:'json',required:false}],configSchema:[{key:'enable_pc',title:'PC 端签到',type:'boolean',default:true},{key:'enable_app',title:'App 端签到',type:'boolean',default:true},{key:'enable_awards',title:'累计奖励领取',type:'boolean',default:true},...shared] as ConfigField[]},run:executeBaidu,probe:probeBaidu,reconcile:reconcileBaidu},
- {manifest:{...bilibiliManifest,version:'0.1.0',credentialSchema:[{key:'cookie',type:'secret',required:true}],configSchema:[...shared,{key:'settle_wait_ms',title:'余额结算等待（毫秒）',type:'integer',default:1200,min:0,max:10000},{key:'max_exchange_bp',title:'单次最多兑换 B 币券数',type:'integer',default:5,min:1,max:20}] as ConfigField[]},run:executeBili,probe:probeBili,reconcile:reconcileBili}
+ {manifest:{...bilibiliManifest,version:'0.2.0',credentialSchema:[{key:'cookie',type:'secret',required:true},{key:'refresh_token',type:'secret',required:false}],configSchema:[...shared,{key:'settle_wait_ms',title:'余额结算等待（毫秒）',type:'integer',default:1200,min:0,max:10000},{key:'max_exchange_bp',title:'单次最多兑换 B 币券数',type:'integer',default:5,min:1,max:20}] as ConfigField[]},run:executeBili,probe:probeBili,reconcile:reconcileBili}
 ];
 export const manifests=moduleDefinitions.map(m=>m.manifest);
 export function moduleDefinition(id:string){return moduleDefinitions.find(m=>m.manifest.id===id);}

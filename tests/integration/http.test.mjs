@@ -84,3 +84,16 @@ test('baidu accounts without BAIDUCUID get a generated device id for App sign-in
   assert.equal((await decrypt(f.env.DATA_KEY,'alice',other.id,other.credentials_enc)).cuid,'EXISTINGCUID123');
  }finally{globalThis.fetch=original;f.DB.close();}
 });
+
+test('run explanations are consistent across dashboard, platform, list and detail without exposing report payloads',async()=>{
+ const f=await setup();try{
+  const aid=randomUUID(),jid=randomUUID(),rid=randomUUID();await account(f.DB,{id:aid,module:'baidu-netdisk'});await job(f.DB,{id:jid,accountId:aid,task:'baidu.daily'});await run(f.DB,{id:rid,jobId:jid,status:'already_done'});
+  const report={enabled:{pc:true,app:true,awards:true},steps:[{id:'pc',ok:true,state:'already_signed'},{id:'app',ok:true,state:'already_signed'}],initialGrowth:6344,finalGrowth:6344,awards:{signinDays:26,nextDay:30,remainingDays:4,claimable:[],tiers:[]},private_diagnostic:'not-for-list'};
+  await f.DB.prepare('UPDATE job_runs SET result_json=? WHERE id=?').bind(JSON.stringify({details:{report}}),rid).run();
+  let summary;
+  for(const [path,key] of [['/api/v1/dashboard','recent'],['/api/v1/platforms/baidu-netdisk','recent'],['/api/v1/runs','items']]){
+   const response=await f.request(path);assert.equal(response.status,200);const data=await response.json(),r=data[key].find(r=>r.id===rid);assert.equal(r.overview.statusLabel,'检查完成');assert.equal(r.status,'already_done');assert.match(r.overview.summary,/暂无可领取奖励/);summary??=r.overview.summary;assert.equal(r.overview.summary,summary);assert.doesNotMatch(JSON.stringify(data),/not-for-list/);assert.equal(Object.hasOwn(r,'result_json'),false);
+  }
+  const detail=await(await f.request('/api/v1/runs/'+rid)).json();assert.equal(detail.run.overview.summary,summary);assert.match(detail.run.overview.nextAction,/还需签到 4 天/);assert.equal(detail.run.overview.items.find(i=>i.label==='PC 签到').status,'今日已签到');assert.equal((await f.request('/api/v1/runs/'+rid,{user:'bob'})).status,404);
+ }finally{f.DB.close();}
+});

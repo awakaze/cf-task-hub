@@ -44,5 +44,5 @@ export async function fingerprint(secret:string,namespace:string,input:string):P
   return toB64(new Uint8Array(await crypto.subtle.sign('HMAC',key,enc.encode(namespace+':'+input))));
 }
 export function redact(text:string):string {
-  return String(text).replace(/(SESSDATA|bili_jct|BDUSS|BAIDU_COOKIE|cookie|sendkey|token|authorization)\s*[:=]\s*[^\s,;"}]+/gi,'$1=[REDACTED]').slice(0,1200);
+  return String(text).replace(/(SESSDATA|bili_jct|BDUSS|BAIDU_COOKIE|cookie|sendkey|refresh_token|ac_time_value|token|authorization)\s*[:=]\s*[^\s,;"}]+/gi,'$1=[REDACTED]').slice(0,1200);
 }

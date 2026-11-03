@@ -85,7 +85,14 @@
     "DLQ_NAME": "cf-task-hub-dlq",
     "APP_ORIGIN": "https://task.awakaze.com",
     "API_PAUSED": "false",
-    "BACKGROUND_PAUSED": "false"
+    "BACKGROUND_PAUSED": "false",
+    "BAIDU_QR_DIAGNOSTICS": "false"
+  },
+  "observability": {
+    "enabled": false,
+    "head_sampling_rate": 1,
+    "redact_query_string": true,
+    "logs": {"enabled": false, "invocation_logs": false, "persist": false}
   },
   "compatibility_flags": [
     "nodejs_compat"

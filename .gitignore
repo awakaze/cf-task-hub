@@ -12,3 +12,6 @@ secrets.*.json
 !secrets.example.json
 *.backup.sql
 .audit-artifacts/
+
+# Local platform credentials; never publish this workspace file.
+/cookie

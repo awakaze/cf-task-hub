@@ -1,7 +1,8 @@
 import test from 'node:test';import assert from 'node:assert/strict';
 import {fixture,account,job,run,memoryStorage} from './helpers/d1.mjs';
 import {AccountCoordinator} from '../src/durable/account-coordinator.ts';
-import {encrypt} from '../src/core/crypto.ts';
+import {encrypt,decrypt} from '../src/core/crypto.ts';
+import {biliSessionStatements} from '../src/core/bilibili-sessions.ts';
 import {setSetting} from '../src/core/db.ts';
 import {verifiedIdentity} from '../src/core/identity.ts';
 async function setup({exchange=true}={}){const f=await fixture();const credentials={cookie:'SESSDATA=mocksession; bili_jct=mockcsrf; DedeUserID=42'};
@@ -20,6 +21,32 @@ function fake({responseLost=false,settles=true,paid=0,coupons=5}={}){let sent=0;
  };return {request,get sent(){return sent;}};}
 async function withFetch(fetcher,fn){const original=globalThis.fetch;globalThis.fetch=fetcher;try{return await fn();}finally{globalThis.fetch=original;}}
 const invoke=(d,path='/run',id='run')=>d.fetch(new Request('https://internal'+path,{method:'POST',body:JSON.stringify({runId:id})}));
+
+test('session rotation and task deliveries share the coordinator and business calls use the new cookie',async()=>{
+ const f=await setup(),upstream=fake();try{
+ const row=await f.DB.prepare("SELECT credentials_enc FROM accounts WHERE id='account'").first(),credentials={...await decrypt(f.env.DATA_KEY,'alice','account',row.credentials_enc),refresh_token:'old-token'};
+ await f.DB.prepare("UPDATE accounts SET credentials_enc=? WHERE id='account'").bind(await encrypt(f.env.DATA_KEY,'alice','account',credentials)).run();await f.DB.batch(biliSessionStatements(f.env,'bilibili-vip','account',credentials));
+ let rotates=0,confirms=0;
+ await withFetch(async(input,init={})=>{
+  const path=new URL(input).pathname;
+  if(path.endsWith('/cookie/info'))return Response.json({code:0,data:{refresh:true,timestamp:Date.now()}});
+  if(path.startsWith('/correspond/1/'))return new Response('<div id="1-name">refresh-csrf</div>');
+  if(path.endsWith('/cookie/refresh')){rotates++;const headers=new Headers();for(const[k,v]of [['SESSDATA','rotated-session'],['bili_jct','rotated-csrf'],['DedeUserID','42']])headers.append('Set-Cookie',`${k}=${v}; Domain=.bilibili.com; Path=/`);return Response.json({code:0,data:{refresh_token:'new-token'}},{headers});}
+  assert.match(new Headers(init.headers).get('Cookie'),/SESSDATA=rotated-session/);
+  if(path.endsWith('/confirm/refresh')){confirms++;return Response.json({code:0});}
+  return upstream.request(input,init);
+ },()=>Promise.all([f.do.fetch(new Request('https://internal/refresh',{method:'POST',body:JSON.stringify({accountId:'account'})})),invoke(f.do),invoke(f.do)]));
+ assert.equal(rotates,1);assert.equal(confirms,1);assert.equal(upstream.sent,1);assert.equal((await f.DB.prepare("SELECT status FROM job_runs WHERE id='run'").first()).status,'succeeded');
+ }finally{f.DB.close();}
+});
+
+test('an expired response for an old cookie cannot pause a concurrently replaced login',async()=>{
+ const f=await setup({exchange:false});try{
+ const fresh=await encrypt(f.env.DATA_KEY,'alice','account',{cookie:'SESSDATA=fresh-session; bili_jct=fresh-csrf; DedeUserID=42'});
+ await withFetch(async()=>{await f.DB.prepare("UPDATE accounts SET credentials_enc=?,enabled=1 WHERE id='account'").bind(fresh).run();return Response.json({code:-101});},()=>invoke(f.do));
+ assert.equal((await f.DB.prepare("SELECT enabled FROM accounts WHERE id='account'").first()).enabled,1);assert.equal((await f.DB.prepare("SELECT enabled FROM jobs WHERE id='job'").first()).enabled,1);assert.equal((await f.DB.prepare("SELECT status FROM job_runs WHERE id='run'").first()).status,'failed');
+ }finally{f.DB.close();}
+});
 test('unified coordinator confirms exact balance delta and concurrent duplicate deliveries post once',async()=>{const f=await setup(),upstream=fake();await withFetch(upstream.request,async()=>{const [a,b]=await Promise.all([invoke(f.do),invoke(f.do)]);assert.equal(a.status,200);assert.equal(b.status,200);});assert.equal(upstream.sent,1);const r=await f.DB.prepare("SELECT * FROM job_runs WHERE id='run'").first();assert.equal(r.status,'succeeded');assert.equal(JSON.parse(r.result_json).details.report.exchange.expectedGoldDelta,5000);assert.equal(await f.storage.get('bili_pending_exchange'),undefined);assert.equal((await f.DB.prepare('SELECT count(*) n FROM job_steps').first()).n,1);f.DB.close();});
 test('an unclear exchange creates a durable latch and a different run cannot send a second order',async()=>{const f=await setup(),upstream=fake({responseLost:true,settles:false});await withFetch(upstream.request,async()=>{await invoke(f.do);await run(f.DB,{id:'next-day',status:'scheduled'});await invoke(f.do,'/run','next-day');});assert.equal(upstream.sent,1);assert.equal((await f.DB.prepare("SELECT status FROM job_runs WHERE id='run'").first()).status,'waiting_retry');assert.equal((await f.DB.prepare("SELECT status FROM job_runs WHERE id='next-day'").first()).status,'failed');assert.equal((await f.storage.get('bili_pending_exchange')).runId,'run');const purge=await f.do.fetch(new Request('https://internal/purge',{method:'POST',body:'{"confirm":true}'}));assert.equal(purge.status,409);f.DB.close();});
 test('stale running exchange recovery is read-only after a coordinator restart',async()=>{const f=await setup();await f.DB.prepare("UPDATE job_runs SET status='running',started_at=? WHERE id='run'").bind(Date.now()-900000).run();await f.storage.put({'report:run':{attempts:1,errors:[],claim:{state:'disabled'},exchange:{state:'request_started',requestedAt:'2026-10-25T00:00:00Z',couponBeforeBp:5,goldBeforeSeeds:10000,expectedGoldDelta:5000,exchangeAmountBp:5,paidBeforeBp:0}},bili_pending_exchange:{runId:'run'}});

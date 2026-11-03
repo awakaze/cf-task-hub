@@ -2,7 +2,7 @@ import type {Hono,Context} from 'hono';
 import {z} from 'zod';
 import type {Env,CurrentUser,JobRecord} from '../core/types.ts';
 import {assert,HttpError,jsonSafeParse} from '../core/response.ts';
-import {encrypt,sha256} from '../core/crypto.ts';
+import {encrypt,decrypt,sha256} from '../core/crypto.ts';
 import {audit,auditStatement,checkLimit,quotas,getAccount,setting} from '../core/db.ts';
 import {mutationGuard} from '../core/mutation-guard.ts';
 import {manifests,moduleDefinition,validateModuleSettings} from '../core/registry.ts';
@@ -13,13 +13,16 @@ import {cookieInput,boundedJson,boundedText} from '../core/network.ts';
 import {requireRunning,takeRate,noUnsettled,sanitizeReport} from '../core/safety.ts';
 import {decryptConfig} from '../core/secrets.ts';
 import {queueRunBatch} from '../core/run-batch.ts';
-import {baiduAuthUrl,baiduQrStart,baiduQrPoll,baiduQrCookie} from '../core/baidu-qr.ts';
+import {BaiduCookieJar,BaiduQrError,baiduAuthUrl,baiduQrStart,baiduQrPoll,baiduQrCookie} from '../core/baidu-qr.ts';
+import {biliQrStart,biliQrPoll} from '../core/bilibili-auth.ts';
+import {biliSessionStatements,credentialMutationGuard} from '../core/bilibili-sessions.ts';
 import {DEFAULT_POLICY} from '../core/notifications.ts';
+import {publicRun} from '../core/run-presentation.ts';
 
 type AppContext={Bindings:Env;Variables:{user:CurrentUser}};
 type App=Hono<AppContext>;
 type GroupRow={id:string;owner_user_id:string;module_id:string;config_json:string;schedule_json:string|null;notify_json:string|null;features_json:string;created_at:number;updated_at:number};
-const credentialsSchema=z.object({cookie:z.string().min(10).max(16000),cuid:z.string().max(500).optional(),headers:z.record(z.string(),z.string().max(500).refine(v=>!/[\r\n]/.test(v))).refine(h=>Object.keys(h).length<=2&&Object.keys(h).every(k=>['user-agent','x-requested-with'].includes(k.toLowerCase())),'Only User-Agent and X-Requested-With are allowed').optional()});
+const credentialsSchema=z.object({cookie:z.string().min(10).max(16000),refresh_token:z.string().min(1).max(4096).regex(/^[A-Za-z0-9._~-]+$/).optional(),cuid:z.string().max(500).optional(),headers:z.record(z.string(),z.string().max(500).refine(v=>!/[\r\n]/.test(v))).refine(h=>Object.keys(h).length<=2&&Object.keys(h).every(k=>['user-agent','x-requested-with'].includes(k.toLowerCase())),'Only User-Agent and X-Requested-With are allowed').optional()});
 const scheduleSchema=z.unknown().transform((value,ctx)=>{try{return validateSchedule(value);}catch{ctx.addIssue({code:'custom',message:'Invalid daily, weekly or interval schedule'});return z.NEVER;}});
 const notifySchema=z.object({success_enabled:z.boolean(),exception_enabled:z.boolean(),success_channels:z.array(z.string().uuid()).max(3),error_mode:z.enum(['same','custom']),exception_channels:z.array(z.string().uuid()).max(3)}).strict();
 
@@ -28,7 +31,7 @@ function moduleOf(c:Context<AppContext>){const id=c.req.param('module')||'';asse
 function defaultConfig(module:string){return Object.fromEntries((moduleDefinition(module)?.manifest.configSchema||[]).map(f=>[f.key,f.default]));}
 function defaultFeatures(module:string){return (manifests.find(m=>m.id===module)?.tasks||[]).filter(t=>t.key!=='bili.exchange').map(t=>t.key);}
 function defaultSchedule(){return {type:'daily' as const,hour:9,minute:0,timezone:BEIJING};}
-function publicAccount(row:Record<string,any>){return {id:row.id,module_id:row.module_id,label:row.label,enabled:!!row.enabled,config:jsonSafeParse(row.config_json,{}),created_at:row.created_at,identity_verified_at:row.identity_verified_at??null};}
+function publicAccount(row:Record<string,any>){return {id:row.id,module_id:row.module_id,label:row.label,enabled:!!row.enabled,config:jsonSafeParse(row.config_json,{}),created_at:row.created_at,identity_verified_at:row.identity_verified_at??null,session_status:row.session_status??'manual',last_refreshed_at:row.last_refreshed_at??null};}
 function groupView(row:GroupRow|null|undefined,module:string){
  if(!row)return {id:null,config:defaultConfig(module),schedule:defaultSchedule(),notify:null,features:defaultFeatures(module)};
  const schedule=jsonSafeParse<any>(row.schedule_json,null);
@@ -128,7 +131,7 @@ async function checkIdentity(env:Env,module:string,credentials:Record<string,unk
   throw new HttpError(422,'UPSTREAM_IDENTITY_FAILED',`无法通过${moduleTitle(module)}登录态校验，请确认 Cookie 中的 ${hint} 完整有效，且账号仍在登录状态${reason?`（原因：${reason}）`:''}`);
  }
 }
-async function prepareAccountBinding(env:Env,owner:string,module:string,label:string,credentials:{cookie:string;cuid?:string;headers?:Record<string,string>},group:GroupRow,targetId?:string,resumeJobs=false){
+async function prepareAccountBinding(env:Env,owner:string,module:string,label:string,credentials:{cookie:string;refresh_token?:string;cuid?:string;headers?:Record<string,string>},group:GroupRow,targetId?:string,resumeJobs=false){
  await requireRunning(env);await takeRate(env,'account-check:'+owner,15,3600000);
  const old=targetId?await getAccount(env,targetId,owner):null;
  if(old)assert(old.module_id===module,404,'NOT_FOUND','账号不属于该平台');
@@ -146,7 +149,8 @@ async function prepareAccountBinding(env:Env,owner:string,module:string,label:st
   ?env.DB.prepare('UPDATE accounts SET label=?,fingerprint=?,credentials_enc=?,identity_verified_at=?,updated_at=?,enabled=? WHERE id=? AND owner_user_id=?').bind(label,identity.fingerprint,encrypted,now,now,resumeJobs?1:old.enabled,id,owner)
   :env.DB.prepare('INSERT INTO accounts(id,owner_user_id,module_id,label,fingerprint,credentials_enc,config_json,enabled,group_id,created_at,updated_at,identity_verified_at) VALUES(?,?,?,?,?,?,?,1,?,?,?,?)').bind(id,owner,module,label,identity.fingerprint,encrypted,group.config_json,group.id,now,now,now);
  const ownerGuard=mutationGuard(env,"EXISTS(SELECT 1 FROM users WHERE id=? AND status='active')"+(old?' AND EXISTS(SELECT 1 FROM accounts WHERE id=? AND owner_user_id=? AND module_id=? AND fingerprint=? AND identity_verified_at IS ?)':''),[owner,...(old?[id,owner,module,old.fingerprint,old.identity_verified_at??null]:[])]);
- return {id,statements:[ownerGuard.before,groupInsert(env,group),account,...jobs,ownerGuard.after]};
+ const credentialGuard=old?credentialMutationGuard(env,old):null;
+ return {id,statements:[ownerGuard.before,...(credentialGuard?[credentialGuard.before]:[]),groupInsert(env,group),account,...biliSessionStatements(env,module,id,credentials),...jobs,...(credentialGuard?[credentialGuard.after]:[]),ownerGuard.after]};
 }
 
 export function registerPlatformRoutes(app:App){
@@ -175,12 +179,12 @@ export function registerPlatformRoutes(app:App){
  app.get('/api/v1/platforms/:module',async c=>{
   const u=user(c),module=moduleOf(c);
   const group=await c.env.DB.prepare('SELECT * FROM platform_groups WHERE owner_user_id=? AND module_id=?').bind(u.id,module).first<GroupRow>();
-  const accounts=await c.env.DB.prepare('SELECT * FROM accounts WHERE owner_user_id=? AND module_id=? ORDER BY created_at DESC,id').bind(u.id,module).all<any>();
+  const accounts=await c.env.DB.prepare('SELECT a.*,s.status session_status,s.last_refreshed_at FROM accounts a LEFT JOIN bili_sessions s ON s.account_id=a.id WHERE a.owner_user_id=? AND a.module_id=? ORDER BY a.created_at DESC,a.id').bind(u.id,module).all<any>();
   const jobs=await c.env.DB.prepare('SELECT j.id,j.account_id,j.task_key,j.schedule_json,j.enabled,j.next_run_at FROM jobs j JOIN accounts a ON a.id=j.account_id WHERE j.owner_user_id=? AND a.module_id=? ORDER BY j.created_at,j.id').bind(u.id,module).all<any>();
-  const recent=await c.env.DB.prepare('SELECT r.id,r.status,r.created_at,r.manual,j.task_key,a.label account_label FROM job_runs r JOIN jobs j ON j.id=r.job_id JOIN accounts a ON a.id=j.account_id WHERE r.owner_user_id=? AND a.module_id=? ORDER BY r.created_at DESC LIMIT 10').bind(u.id,module).all<any>();
+  const recent=await c.env.DB.prepare('SELECT r.id,r.status,r.created_at,r.manual,r.result_json,j.task_key,a.label account_label FROM job_runs r JOIN jobs j ON j.id=r.job_id JOIN accounts a ON a.id=j.account_id WHERE r.owner_user_id=? AND a.module_id=? ORDER BY r.created_at DESC LIMIT 10').bind(u.id,module).all<any>();
   const flags=await setting<any>(c.env,'modules_enabled',{'baidu-netdisk':true,'bilibili-vip':true});
   const manifest=manifests.find(m=>m.id===module)!;
-  return c.json({module:{...manifest,enabled:flags?.[module]!==false},group:groupView(group,module),accounts:accounts.results.map(publicAccount),jobs:jobs.results.map((j:any)=>({...j,enabled:!!j.enabled})),recent:recent.results});
+  return c.json({module:{...manifest,enabled:flags?.[module]!==false},group:groupView(group,module),accounts:accounts.results.map(publicAccount),jobs:jobs.results.map((j:any)=>({...j,enabled:!!j.enabled})),recent:recent.results.map(x=>publicRun(x))});
  });
  app.put('/api/v1/platforms/:module',async c=>{
   const u=user(c),module=moduleOf(c);
@@ -220,11 +224,14 @@ export function registerPlatformRoutes(app:App){
    fp=identity.fingerprint;creds=await encrypt(c.env.DATA_KEY,u.id,id,{...input,externalId:identity.externalId});verified=Date.now();
   }
   if(body.enabled===true||body.resumeJobs){assert(verified,409,'REVERIFY_REQUIRED','请先重新验证账号凭据再启用');await moduleEnabled(c.env,module);assert(body.enabled!==false,400,'INVALID_RESUME','恢复任务时不能同时暂停账号');}
+  if((body.enabled===true||body.resumeJobs)&&!body.credentials){const session=await c.env.DB.prepare('SELECT status FROM bili_sessions WHERE account_id=?').bind(id).first<{status:string}>();assert(session?.status!=='needs_login',409,'BILI_RELOGIN_REQUIRED','请先重新扫码或导入新的登录凭据，再恢复账号及计划');}
   const statements=[c.env.DB.prepare('UPDATE accounts SET label=?,enabled=?,credentials_enc=?,fingerprint=?,updated_at=?,identity_verified_at=? WHERE id=? AND owner_user_id=?').bind(body.label??old.label,body.resumeJobs?1:body.enabled===undefined?old.enabled:body.enabled?1:0,creds,fp,Date.now(),verified??null,id,u.id)];
+  if(body.credentials)statements.push(...biliSessionStatements(c.env,module,id,body.credentials));
   if(body.resumeJobs){const group=await ensureGroup(c.env,u.id,module);statements.push(groupInsert(c.env,group),...await jobStatements(c.env,group,module,jsonSafeParse<any>(group.schedule_json,null)||defaultSchedule(),{onlyAccountId:id}));}
   if(body.enabled===false)statements.push(c.env.DB.prepare('UPDATE jobs SET enabled=0,updated_at=? WHERE account_id=? AND owner_user_id=?').bind(Date.now(),id,u.id));
   const guard=mutationGuard(c.env,'EXISTS(SELECT 1 FROM accounts WHERE id=? AND owner_user_id=? AND module_id=? AND fingerprint=?)',[id,u.id,module,old.fingerprint]);
-  await c.env.DB.batch([guard.before,...statements,auditStatement(c.env,u.id,'account.update',id),guard.after]);
+  const credentialGuard=credentialMutationGuard(c.env,old);
+  await c.env.DB.batch([guard.before,credentialGuard.before,...statements,auditStatement(c.env,u.id,'account.update',id),credentialGuard.after,guard.after]);
   return c.json({ok:true});
  });
  app.delete('/api/v1/platforms/:module/accounts/:id',async c=>{
@@ -294,69 +301,89 @@ export function registerPlatformRoutes(app:App){
  // The authorization session owns its target account and a bounded poll lease.
  app.post('/api/v1/platforms/:module/qr/start',async c=>{
   const u=user(c),module=moduleOf(c);
-  assert(module==='baidu-netdisk',400,'UNSUPPORTED','该平台暂不支持扫码登录');
   const body=z.object({accountId:z.string().uuid().optional(),resumeJobs:z.boolean().default(false)}).strict().parse((await c.req.json().catch(()=>null))??{});
   await moduleEnabled(c.env,module);await requireRunning(c.env);
   await takeRate(c.env,'qr-start:'+u.id,10,3600000);
   if(body.accountId){const a=await getAccount(c.env,body.accountId,u.id);assert(a.module_id===module,404,'NOT_FOUND','账号不属于该平台');}
   else await checkLimit(c.env,u.id,'accounts',(await quotas(c.env,u.id)).max_accounts);
-  const qr=await baiduQrStart(upstreamFetch(c.env));
+  const qr=module==='bilibili-vip'?await biliQrStart(upstreamFetch(c.env)):await baiduQrStart(upstreamFetch(c.env));
   const now=Date.now(),id=crypto.randomUUID(),expires=now+180000;
+  // The existing private sign column stores a versioned, encrypted Baidu session.
+  // Bind its ciphertext to both owner and challenge; never return it to the UI.
+  const storedSign='cookies' in qr?'enc:'+await encrypt(c.env.DATA_KEY,u.id,'qr:'+id,{sign:qr.sign,cookies:qr.cookies}):qr.sign;
   await c.env.DB.batch([
    c.env.DB.prepare('DELETE FROM login_challenges WHERE id IN(SELECT id FROM login_challenges WHERE expires_at<? AND (lease_until IS NULL OR lease_until<?) LIMIT 100)').bind(now,now),
-   c.env.DB.prepare('INSERT INTO login_challenges(id,owner_user_id,module_id,sign,status,created_at,expires_at,target_account_id,resume_jobs) VALUES(?,?,?,?,?,?,?,?,?)').bind(id,u.id,module,qr.sign,'pending',now,expires,body.accountId??null,body.resumeJobs?1:0)
+   c.env.DB.prepare('INSERT INTO login_challenges(id,owner_user_id,module_id,sign,status,created_at,expires_at,target_account_id,resume_jobs) VALUES(?,?,?,?,?,?,?,?,?)').bind(id,u.id,module,storedSign,'pending',now,expires,body.accountId??null,body.resumeJobs?1:0)
   ]);
-  return c.json({id,qr:qr.qr,auth_url:baiduAuthUrl(qr.sign),expires_at:expires});
+  return c.json({id,qr:qr.qr,auth_url:'auth_url' in qr?qr.auth_url:baiduAuthUrl(qr.sign),expires_at:expires});
  });
  app.post('/api/v1/platforms/:module/qr/:id/poll',async c=>{
   const u=user(c),module=moduleOf(c);
-  assert(module==='baidu-netdisk',400,'UNSUPPORTED','该平台暂不支持扫码登录');
   // Pause/module checks precede ANY upstream work, including unconfirmed polls.
   await requireRunning(c.env);await moduleEnabled(c.env,module);
   await takeRate(c.env,'qr-poll:'+u.id,120,180000);
-  const body=z.object({label:z.string().min(1).max(50).default('百度网盘账号'),accountId:z.string().uuid().optional(),resumeJobs:z.boolean().optional()}).strict().parse((await c.req.json().catch(()=>null))??{});
+  const body=z.object({label:z.string().min(1).max(50).default(module==='bilibili-vip'?'B站账号':'百度网盘账号'),accountId:z.string().uuid().optional(),resumeJobs:z.boolean().optional()}).strict().parse((await c.req.json().catch(()=>null))??{});
   const challenge=await c.env.DB.prepare('SELECT * FROM login_challenges WHERE id=? AND owner_user_id=? AND module_id=?').bind(c.req.param('id'),u.id,module).first<any>();
   assert(challenge,404,'NOT_FOUND','扫码会话不存在');
   if(body.accountId!==undefined)assert(body.accountId===challenge.target_account_id,409,'QR_TARGET_CHANGED','不能更改扫码会话绑定的账号');
   if(body.resumeJobs!==undefined)assert(Number(body.resumeJobs)===Number(challenge.resume_jobs),409,'QR_TARGET_CHANGED','不能更改扫码会话的恢复选项');
   if(challenge.status==='confirmed'&&challenge.account_id)return c.json({status:'confirmed',account_id:challenge.account_id});
-  if(challenge.status==='failed')return c.json({status:'failed',message:'本次绑定未完成，请重新扫码或导入 Cookie'});
+  if(challenge.status==='failed')return c.json({status:'failed',message:['NETDISK_COOKIE_INCOMPLETE','BAIDU_QR_STOKEN_MISSING'].includes(challenge.last_error)?'百度未返回完整网盘登录态，请重新扫码或导入完整 Cookie':challenge.last_error==='COOKIE_EXCHANGE_FAILED'||String(challenge.last_error).startsWith('BAIDU_QR_')?'百度登录态交换未完成，请重新扫码或导入 Cookie':'本次绑定未完成，请重新扫码或导入 Cookie'});
   const now=Date.now();
   assert(Number(challenge.expires_at)>now,410,'QR_EXPIRED','二维码已过期，请重新生成');
   if(challenge.status==='processing'){
    if(Number(challenge.lease_until)>now)return c.json({status:'processing',retry_after_ms:2500});
-   await c.env.DB.prepare("UPDATE login_challenges SET status='failed',last_error='PROCESSING_INTERRUPTED',lease_token=NULL,lease_until=NULL WHERE id=? AND status='processing' AND lease_until<=?").bind(challenge.id,now).run();
+   await c.env.DB.prepare("UPDATE login_challenges SET status='failed',sign='',last_error='PROCESSING_INTERRUPTED',lease_token=NULL,lease_until=NULL WHERE id=? AND status='processing' AND lease_until<=?").bind(challenge.id,now).run();
    return c.json({status:'failed',message:'绑定中断，请重新扫码；不会把未完成的绑定视为成功'});
   }
   assert(Number(challenge.poll_count)<60,429,'QR_POLL_LIMIT','本次二维码查询次数已用完，请重新生成');
   if(Number(challenge.lease_until)>now||Number(challenge.next_poll_at)>now)return c.json({status:'pending',retry_after_ms:2500});
   const lease=crypto.randomUUID();
-  const claimed=await c.env.DB.prepare("UPDATE login_challenges SET lease_token=?,lease_until=?,poll_count=poll_count+1,next_poll_at=? WHERE id=? AND owner_user_id=? AND status='pending' AND expires_at>? AND poll_count<60 AND next_poll_at<=? AND (lease_until IS NULL OR lease_until<=?) RETURNING id").bind(lease,now+120000,now+2000,challenge.id,u.id,now,now,now).first();
+  const claimed=await c.env.DB.prepare("UPDATE login_challenges SET lease_token=?,lease_until=?,poll_count=poll_count+1,next_poll_at=? WHERE id=? AND owner_user_id=? AND status='pending' AND expires_at>? AND poll_count<60 AND next_poll_at<=? AND (lease_until IS NULL OR lease_until<=?) RETURNING id,sign").bind(lease,now+120000,now+2000,challenge.id,u.id,now,now,now).first<{id:string;sign:string}>();
   if(!claimed)return c.json({status:'pending',retry_after_ms:2500});
-  let processing=false;
+  let processing=false,stage='BINDING_FAILED',savedSign=claimed.sign;
   try{
-   const state=await baiduQrPoll(String(challenge.sign),upstreamFetch(c.env));
-   if(!(state.status===0&&state.v))return c.json({status:state.status===1?'scanned':'pending',retry_after_ms:2500});
+   let credentials:{cookie:string;refresh_token?:string},baiduTicket='',baiduJar:BaiduCookieJar|undefined;
+   if(module==='bilibili-vip'){
+    const state=await biliQrPoll(String(challenge.sign),upstreamFetch(c.env));
+    if(state.status==='expired')throw new HttpError(410,'QR_EXPIRED','二维码已过期，请重新生成');
+    if(state.status!=='confirmed'||!state.credentials)return c.json({status:state.status,retry_after_ms:2500});
+    credentials=state.credentials;
+   }else{
+    // Plain signs are accepted only for short-lived challenges created before
+    // this upgrade; all newly created Baidu challenges carry encrypted cookies.
+    const session=savedSign.startsWith('enc:')?await decrypt<{sign:string;cookies:ReturnType<BaiduCookieJar['snapshot']>}>(c.env.DATA_KEY,u.id,'qr:'+challenge.id,savedSign.slice(4)):{sign:savedSign,cookies:[]};
+    baiduJar=new BaiduCookieJar(session.cookies);
+    const state=await baiduQrPoll(session.sign,upstreamFetch(c.env),undefined,baiduJar);
+    if(c.env.BAIDU_QR_DIAGNOSTICS==='true')console.info('[baidu-qr-debug]',JSON.stringify({trace:challenge.id,event:'poll_result',status:state.status,has_ticket:!!state.v}));
+    savedSign='enc:'+await encrypt(c.env.DATA_KEY,u.id,'qr:'+challenge.id,{sign:session.sign,cookies:baiduJar.snapshot()});
+    if(!(state.status===0&&state.v))return c.json({status:state.status===1?'scanned':'pending',retry_after_ms:2500});
+    baiduTicket=state.v;credentials={cookie:''};
+   }
    await requireRunning(c.env);await moduleEnabled(c.env,module);
    const moved=await c.env.DB.prepare("UPDATE login_challenges SET status='processing' WHERE id=? AND lease_token=? AND status='pending' RETURNING id").bind(challenge.id,lease).first();
    assert(moved,409,'QR_STATE_CHANGED','扫码会话状态已变化，请重新生成');processing=true;
-   const cookie=await baiduQrCookie(state.v,upstreamFetch(c.env));
+   if(baiduTicket){stage='COOKIE_EXCHANGE_FAILED';credentials.cookie=await baiduQrCookie(baiduTicket,upstreamFetch(c.env),undefined,baiduJar,c.env.BAIDU_QR_DIAGNOSTICS==='true'?challenge.id:undefined);}
+   stage='BINDING_FAILED';
+   if(module==='baidu-netdisk'&&c.env.BAIDU_QR_DIAGNOSTICS==='true')console.info('[baidu-qr-debug]',JSON.stringify({trace:challenge.id,event:'binding_start'}));
    const group=await ensureGroup(c.env,u.id,module);
    const target=challenge.target_account_id?await getAccount(c.env,String(challenge.target_account_id),u.id):null;
-   const account=await prepareAccountBinding(c.env,u.id,module,target?String(target.label):body.label,{cookie},group,challenge.target_account_id||undefined,!!challenge.resume_jobs);
+   const account=await prepareAccountBinding(c.env,u.id,module,target?String(target.label):body.label,credentials,group,challenge.target_account_id||undefined,!!challenge.resume_jobs);
    const guard=mutationGuard(c.env,"EXISTS(SELECT 1 FROM login_challenges WHERE id=? AND owner_user_id=? AND status='processing' AND lease_token=? AND lease_until>?)",[challenge.id,u.id,lease,Date.now()]);
    await c.env.DB.batch([
     guard.before,
     ...account.statements,
-    c.env.DB.prepare("UPDATE login_challenges SET status='confirmed',account_id=?,consumed_at=?,lease_token=NULL,lease_until=NULL,last_error=NULL WHERE id=? AND lease_token=? AND status='processing'").bind(account.id,Date.now(),challenge.id,lease),
+    c.env.DB.prepare("UPDATE login_challenges SET status='confirmed',sign='',account_id=?,consumed_at=?,lease_token=NULL,lease_until=NULL,last_error=NULL WHERE id=? AND lease_token=? AND status='processing'").bind(account.id,Date.now(),challenge.id,lease),
     auditStatement(c.env,u.id,target?'account.update':'account.create',account.id,{module_id:module,via:'qr'}),guard.after
    ]);
+   if(module==='baidu-netdisk'&&c.env.BAIDU_QR_DIAGNOSTICS==='true')console.info('[baidu-qr-debug]',JSON.stringify({trace:challenge.id,event:'binding_complete'}));
    return c.json({status:'confirmed',account_id:account.id});
   }catch(error){
-   if(processing)await c.env.DB.prepare("UPDATE login_challenges SET status='failed',last_error='BINDING_FAILED',lease_token=NULL,lease_until=NULL WHERE id=? AND lease_token=? AND status='processing'").bind(challenge.id,lease).run();
+   if(module==='baidu-netdisk'&&c.env.BAIDU_QR_DIAGNOSTICS==='true')console.info('[baidu-qr-debug]',JSON.stringify({trace:challenge.id,event:'challenge_failed',processing,reason:error instanceof BaiduQrError?error.code:stage}));
+   if(processing)await c.env.DB.prepare("UPDATE login_challenges SET status='failed',sign='',last_error=?,lease_token=NULL,lease_until=NULL WHERE id=? AND lease_token=? AND status='processing'").bind(error instanceof BaiduQrError?error.code:stage,challenge.id,lease).run();
    throw error;
   }finally{
-   await c.env.DB.prepare("UPDATE login_challenges SET lease_token=NULL,lease_until=NULL,next_poll_at=? WHERE id=? AND lease_token=? AND status='pending'").bind(Date.now()+2000,challenge.id,lease).run();
+   await c.env.DB.prepare("UPDATE login_challenges SET sign=?,lease_token=NULL,lease_until=NULL,next_poll_at=? WHERE id=? AND lease_token=? AND status='pending'").bind(savedSign,Date.now()+2000,challenge.id,lease).run();
   }
  });
 }

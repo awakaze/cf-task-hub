@@ -6,6 +6,7 @@ import {setting} from '../core/db.ts';
 import {sanitizeReport} from '../core/safety.ts';
 import {verifiedIdentity,SessionExpiredError} from '../core/identity.ts';
 import {upstreamFetch} from '../core/upstream-fetch.ts';
+import {ensureBiliSession,BiliSessionUnavailable} from '../core/bilibili-sessions.ts';
 function submitted(report:any):boolean{return !!(report?.exchange?.requestedAt||report?.claim?.requestedAt||report?.steps?.some((s:any)=>['before_operation','operation_confirmed'].includes(s.phase)));}
 const EVIDENCE_RETENTION=365*86400000;
 function evidenceKey(kind:'report'|'settlement',expiresAt:number,id:string){return kind+'-expiry:'+String(expiresAt).padStart(16,'0')+':'+id;}
@@ -17,6 +18,11 @@ export class AccountCoordinator implements DurableObject{
  private exclusive<T>(fn:()=>Promise<T>):Promise<T>{const r=this.tail.then(fn);this.tail=r.catch(()=>{});return r;}
  async fetch(req:Request):Promise<Response>{return this.exclusive(async()=>{
   const path=new URL(req.url).pathname;
+  if(path==='/refresh'){
+   const body:any=await req.json();if(typeof body.accountId!=='string'||body.accountId.length>128)return new Response('',{status:400});
+   try{await ensureBiliSession(this.env,body.accountId);return Response.json({ok:true});}
+   catch(error){if(error instanceof SessionExpiredError||error instanceof BiliSessionUnavailable)return Response.json({ok:true});return Response.json({ok:false},{status:503});}
+  }
   if(path!=='/rate'&&await this.state.storage.get('evidence-index-version')!==1)await this.alarmNoLater(Date.now()+1000);
   if(path==='/rate'){
    const x:any=await req.json();
@@ -270,9 +276,15 @@ export class AccountCoordinator implements DurableObject{
   const changed=await this.env.DB.prepare("UPDATE job_runs SET status='running',started_at=coalesce(started_at,?) WHERE id=? AND status=? RETURNING id").bind(Date.now(),run.id,run.status).first();
   if(!changed)return;
   let result:TaskResult;
+  let credentialSnapshot=String(account.credentials_enc);
   const settings=jsonSafeParse<Record<string,unknown>>(account.config_json,{});
   try{
-   const credentials=await decryptConfig<Record<string,unknown>>(this.env,run.owner_user_id,account.id,account.credentials_enc);
+   if(account.module_id==='bilibili-vip'&&!readOnly){
+    await ensureBiliSession(this.env,account.id,false);
+    const latest=await this.env.DB.prepare('SELECT credentials_enc FROM accounts WHERE id=?').bind(account.id).first<{credentials_enc:string}>();
+    if(!latest)throw new BiliSessionUnavailable();credentialSnapshot=latest.credentials_enc;
+   }
+   const credentials=await decryptConfig<Record<string,unknown>>(this.env,run.owner_user_id,account.id,credentialSnapshot);
    const fetcher=upstreamFetch(this.env);
    if(!readOnly){const identity=await verifiedIdentity(this.env,account.module_id,credentials,fetcher);if(identity.fingerprint!==account.fingerprint)throw new Error('Account identity changed');}
    const ctx={taskKey:job.task_key,credentials,settings,fetcher,load:()=>this.state.storage.get(key),save:async(report:any)=>{
@@ -288,13 +300,17 @@ export class AccountCoordinator implements DurableObject{
   }catch(error){
    // Surface the real upstream failure (e.g. Bilibili -352 risk control) for
    // wrangler tail; the message carries no Cookie or credential material.
-   console.error(`[coordinator] ${run.id} task failed:`,error);
-   if(error instanceof SessionExpiredError){await this.env.DB.batch([this.env.DB.prepare('UPDATE accounts SET enabled=0 WHERE id=?').bind(account.id),this.env.DB.prepare('UPDATE jobs SET enabled=0 WHERE account_id=?').bind(account.id)]);}
+   if(!(error instanceof BiliSessionUnavailable))console.error(`[coordinator] ${run.id} task failed:`,error);
+   if(error instanceof SessionExpiredError){await this.env.DB.batch([
+    this.env.DB.prepare('UPDATE accounts SET enabled=0 WHERE id=? AND credentials_enc=?').bind(account.id,credentialSnapshot),
+    this.env.DB.prepare('UPDATE jobs SET enabled=0 WHERE account_id=? AND EXISTS(SELECT 1 FROM accounts WHERE id=? AND credentials_enc=? AND enabled=0)').bind(account.id,account.id,credentialSnapshot),
+    this.env.DB.prepare("UPDATE bili_sessions SET status='needs_login' WHERE account_id=? AND EXISTS(SELECT 1 FROM accounts WHERE id=? AND credentials_enc=? AND enabled=0)").bind(account.id,account.id,credentialSnapshot),
+   ]);}
    const checkpoint=await this.state.storage.get<any>(key);
    const mayHaveSubmitted=submitted(checkpoint);
    const raw=error instanceof Error?error.message:'';
    const reason=raw&&!/[\r\n]/.test(raw)?raw.slice(0,800):'';
-   result={status:mayHaveSubmitted?'waiting_verification':'failed',summary:mayHaveSubmitted?'External operation may have been submitted; review required':error instanceof SessionExpiredError?'Platform session expired. Account and schedules paused; update credentials and re-enable.':'Account check or task request failed; no successful completion confirmed'+(reason?`（原因：${reason}）`:''),details:{report:checkpoint||null}};
+   result={status:mayHaveSubmitted?'waiting_verification':'failed',summary:mayHaveSubmitted?'External operation may have been submitted; review required':error instanceof SessionExpiredError?'Platform session expired. Account and schedules paused; update credentials and re-enable.':'Account check or task request failed; no successful completion confirmed'+(reason?`（原因：${reason}）`:''),details:{report:checkpoint||null,reason:error instanceof SessionExpiredError?'session_expired':error instanceof BiliSessionUnavailable?'credential_pending':'request_failed'}};
   }
   if(job.task_key==='bili.exchange'&&result.status==='succeeded'){
    const report=await this.state.storage.get<any>(key);
@@ -305,8 +321,9 @@ export class AccountCoordinator implements DurableObject{
   }
   const report=await this.state.storage.get<any>(key),attempts=Number(report?.attempts||0);
   if(source!=='reconcile'&&attempts>0&&attempts<2&&((job.task_key==='baidu.daily'&&result.status==='failed')||result.status==='waiting_verification')){
-   await this.env.DB.prepare("UPDATE job_runs SET status='waiting_retry',result_json=? WHERE id=?").bind(JSON.stringify({summary:result.summary,details:sanitizeReport(result.details||{})}),run.id).run();
-   await this.state.storage.put('retry:'+run.id,Date.now()+Number(settings.retry_minutes||30)*60000);await this.arm();return;
+   const retryAt=Date.now()+Number(settings.retry_minutes||30)*60000;
+   await this.env.DB.prepare("UPDATE job_runs SET status='waiting_retry',result_json=? WHERE id=?").bind(JSON.stringify({summary:result.summary,details:sanitizeReport(result.details||{}),retry_at:retryAt}),run.id).run();
+   await this.state.storage.put('retry:'+run.id,retryAt);await this.arm();return;
   }
   await this.finalize(run,result);
  }

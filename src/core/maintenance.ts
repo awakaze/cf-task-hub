@@ -1,5 +1,6 @@
 import type {Env} from './types.ts';
 import {setSetting} from './db.ts';
+import {dispatchBiliSessionChecks} from './bilibili-sessions.ts';
 // Recovery is driven by active targets, not every historical sent intent.
 // CROSS JOIN keeps the small status-indexed target set on the outer loop.
 export async function maintenance(env:Env){
@@ -29,4 +30,5 @@ export async function maintenance(env:Env){
   env.DB.prepare("DELETE FROM usage_daily WHERE day<date(?/1000,'unixepoch','-30 day')").bind(now),
  ]);
  await setSetting(env,'maintenance_heartbeat',now);
+ await dispatchBiliSessionChecks(env);
 }

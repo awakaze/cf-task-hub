@@ -1,3 +1,4 @@
+import {runOverview} from './run-presentation.ts';
 export type NotificationPolicy={
   success_enabled:boolean; exception_enabled:boolean; success_channels:string[];
   error_mode:'same'|'custom'; exception_channels:string[];
@@ -60,7 +61,8 @@ export function notificationText(e:{event_type:string;summary:string;module_id?:
  const lines:string[]=[];
  if(e.account_label)lines.push(`账号：${e.account_label}`);
  if(e.task_key)lines.push(`任务：${TASK_TITLES[e.task_key]||e.task_key}`);
- lines.push(...detailLines(e.module_id,e.report,e.summary));
+ const overview=runOverview({task_key:e.task_key,status:e.event_type==='success'?'succeeded':e.event_type==='info'?'already_done':'failed',result:{summary:e.summary,details:{report:e.report}}},false);
+ lines.push(...detailLines(e.module_id,e.report,e.report?overview.summary:e.summary));
  lines.push(`时间：${beijingTime(e.created_at)}（北京时间）`);
  if(e.run_url)lines.push(e.run_url);
  return {title,text:lines.join('\n')};

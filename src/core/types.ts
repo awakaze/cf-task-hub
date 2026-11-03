@@ -15,6 +15,7 @@ export interface Env {
   BACKGROUND_PAUSED?: string;
   /** Optional outbound relay; disabled unless exactly 'true'. */
   GOOGLE_RELAY_ENABLED?: string;
+  BAIDU_QR_DIAGNOSTICS?: string;
   GOOGLE_RELAY_URL?: string;
   GOOGLE_RELAY_HMAC_SECRET?: string;
 }
@@ -22,5 +23,5 @@ export type User = {id:string;username:string;role:'admin'|'user';status:'active
 export type CurrentUser = User & {sessionId:string;csrfHash:string;csrfToken?:string;recovery_password_reset_allowed?:boolean;recovery_password_reset_expires_at?:number|null};
 export type AccountRecord = {id:string;owner_user_id:string;module_id:string;label:string;fingerprint:string;credentials_enc:string;config_json:string;enabled:number};
 export type JobRecord = {id:string;owner_user_id:string;account_id:string;task_key:string;schedule_json:string;enabled:number;next_run_at:number|null};
-export type QueueItem = {kind:'run'|'notify'|'dispatch'|'maintenance';id:string};
+export type QueueItem = {kind:'run'|'notify'|'dispatch'|'maintenance'|'credential';id:string};
 export type TaskResult = {status:'succeeded'|'already_done'|'failed'|'waiting_verification';summary:string;details?:Record<string,unknown>};

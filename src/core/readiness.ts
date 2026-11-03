@@ -10,7 +10,7 @@ export function clearReadinessCache(env:Env){cache.delete(env.DB);}
 async function inspect(env:Env):Promise<{ready:boolean;reason?:string}>{
  try{
   const schema=await env.DB.prepare("SELECT value_json FROM system_settings WHERE key='schema_version'").first<{value_json:string}>();
-  if(Number(schema?.value_json)!==8)return {ready:false,reason:'Database migration required: run npm run db:remote'};
+  if(Number(schema?.value_json)!==9)return {ready:false,reason:'Database migration required: run npm run db:remote'};
   if(!env.DATA_KEY||fromB64(env.DATA_KEY).length!==32)return {ready:false,reason:'Set a valid DATA_KEY in Cloudflare Secrets'};
   if(!env.PASSWORDS)return {ready:false,reason:'Deploy the PASSWORDS Durable Object binding'};
   const admin=await env.DB.prepare("SELECT id FROM users WHERE role='admin'").first();

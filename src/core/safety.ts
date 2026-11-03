@@ -22,10 +22,10 @@ export async function takeRate(env:Env,key:string,limit:number,windowMs:number){
 export function sanitizeReport(value:unknown,depth=0):any{
  if(depth>8)return '[depth limit]';
  if(value===null||typeof value==='boolean'||typeof value==='number')return value;
- if(typeof value==='string')return value.replace(/(SESSDATA|bili_jct|BDUSS|cookie|token|sendkey|authorization)\s*[:=]\s*[^\s,;"}]+/gi,'$1=[REDACTED]').replace(/https?:\/\/[^\s]+/gi,'[URL]').slice(0,800);
+ if(typeof value==='string')return value.replace(/(SESSDATA|bili_jct|BDUSS|cookie|refresh_token|ac_time_value|token|sendkey|authorization)\s*[:=]\s*[^\s,;"}]+/gi,'$1=[REDACTED]').replace(/https?:\/\/[^\s]+/gi,'[URL]').slice(0,800);
  if(Array.isArray(value))return value.slice(0,60).map(v=>sanitizeReport(v,depth+1));
  if(typeof value==='object'&&value){const out:Record<string,unknown>={};for(const [k,v] of Object.entries(value).slice(0,80)){
-  if(/cookie|csrf|token|secret|password|authorization|credentials|headers|sendkey|^mid$|^uname$|^externalId$/i.test(k))continue;
+  if(/cookie|csrf|token|ac_time_value|secret|password|authorization|credentials|headers|sendkey|^mid$|^uname$|^externalId$/i.test(k))continue;
   out[k]=sanitizeReport(v,depth+1);
  }return out;}
  return null;

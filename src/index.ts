@@ -63,6 +63,7 @@ knownApiRoute=routeMatcher(app.routes);
 app.get('/health',c=>c.json({ok:true,service:'cf-task-hub',version:'0.1.0',meaning:'HTTP handler only; login/setup API checks readiness'}));
 app.notFound(c=>c.json({ok:false,error:'NOT_FOUND',message:'Route not found'},404));
 app.onError((err,c)=>{
+ if(err?.name==='BiliAuthError')return c.json({ok:false,error:'BILI_AUTH_UNAVAILABLE',message:err.message},502);
  if(err instanceof SessionExpiredError)return c.json({ok:false,error:'UPSTREAM_SESSION_EXPIRED',message:'Platform login expired; update the platform Cookie, not your Task Hub login.'},422);
  if(err instanceof HttpError)return c.json({ok:false,error:err.code,message:err.detail},err.status as any);
  if((err as any)?.name==='ZodError')return c.json({ok:false,error:'VALIDATION_ERROR',message:'Invalid request fields',details:(err as any).issues?.slice(0,10).map((x:any)=>({path:x.path?.slice(0,6).map((p:any)=>String(p).slice(0,80)),message:String(x.message).slice(0,160)}))},400);

@@ -8,6 +8,9 @@ const PAN_ROOT=new URL('https://pan.baidu.com/');
 const IMAGE_LIMIT=200000;
 const IMAGE_TYPES=new Set(['image/png','image/jpeg','image/gif','image/webp']);
 function upstreamError(message='百度登录服务暂不可用，请稍后重试或改用 Cookie 导入'):HttpError{return new HttpError(502,'UPSTREAM_ERROR',message);}
+export class BaiduQrError extends HttpError{
+ constructor(code:string,message:string,status=502){super(status,code,message);}
+}
 function approvedUrl(input:string,base?:URL):URL{
  let url:URL;try{url=new URL(input,base);}catch{throw upstreamError('百度登录服务返回了无效地址');}
  if(input.length>16384||url.protocol!=='https:'||url.port&&url.port!=='443'||url.username||url.password||url.hash||!BAIDU_HOSTS.has(url.hostname.toLowerCase()))throw upstreamError('百度登录服务返回了不受信任的地址');
@@ -40,8 +43,17 @@ function parseCallback(text:string):any{
 type StoredCookie={name:string;value:string;domain:string;hostOnly:boolean;path:string;secure:boolean;expiresAt:number|null;sourceHost:string;order:number};
 function defaultCookiePath(url:URL){const path=url.pathname;if(!path.startsWith('/'))return '/';const i=path.lastIndexOf('/');return i<=0?'/':path.slice(0,i);}
 function pathMatches(request:string,path:string){return request===path||request.startsWith(path)&&(path.endsWith('/')||request[path.length]==='/');}
-class BaiduCookieJar{
+export class BaiduCookieJar{
  private cookies=new Map<string,StoredCookie>();private sequence=0;
+ constructor(snapshot:StoredCookie[]=[]){
+  if(!Array.isArray(snapshot)||snapshot.length>64)throw upstreamError('百度扫码会话无效，请重新生成二维码');
+  for(const c of snapshot){
+   if(!c||typeof c.sourceHost!=='string'||!BAIDU_HOSTS.has(c.sourceHost)||typeof c.path!=='string'||!c.path.startsWith('/')||/[;\r\n]/.test(c.path)||typeof c.name!=='string'||typeof c.value!=='string'||typeof c.domain!=='string'||/[;\r\n]/.test(c.domain)||typeof c.hostOnly!=='boolean'||typeof c.secure!=='boolean'||c.expiresAt!==null&&!Number.isFinite(c.expiresAt))throw upstreamError('百度扫码会话无效，请重新生成二维码');
+   const headers=new Headers({'Set-Cookie':`${c.name}=${c.value}; Path=${c.path}${c.hostOnly?'':'; Domain='+c.domain}${c.secure?'; Secure':''}${c.expiresAt===null?'':'; Expires='+new Date(c.expiresAt).toUTCString()}`});
+   this.collect(new Response(null,{headers}),approvedUrl('https://'+c.sourceHost+c.path));
+  }
+ }
+ snapshot(){return [...this.cookies.values()].filter(c=>c.expiresAt===null||c.expiresAt>Date.now()).map(c=>({...c}));}
  private key(name:string,domain:string,path:string){return name+'\n'+domain+'\n'+path;}
  collect(response:Response,url:URL){
   const headers=response.headers as Headers&{getSetCookie?:()=>string[]};
@@ -84,15 +96,31 @@ class BaiduCookieJar{
  header(url:URL){const value=this.applicable(url).map(c=>c.name+'='+c.value).join('; ');if(value.length>16000)throw upstreamError('百度登录 Cookie 超过允许大小');return value;}
  value(name:string,url:URL,sourceHost?:string){return this.applicable(url).find(c=>c.name===name&&(!sourceHost||c.sourceHost===sourceHost))?.value||'';}
 }
-type BaiduResponse={response:Response;url:URL;signal:AbortSignal};
-async function requestBaidu(input:string|URL,fetcher:typeof fetch,{jar,timeout=10000,parent,maxRequests=4}:{jar?:BaiduCookieJar;timeout?:number;parent?:AbortSignal;maxRequests?:number}={}):Promise<BaiduResponse>{
+type BaiduResponse={response:Response;url:URL;signal:AbortSignal;cookiesReady?:boolean};
+function qrDebug(trace:string|undefined,event:string,fields:Record<string,unknown>){if(trace)console.info('[baidu-qr-debug]',JSON.stringify({trace,event,...fields}));}
+function cookieShape(jar:BaiduCookieJar){return jar.snapshot().filter(c=>['BDUSS','STOKEN','PTOKEN','BAIDUID','SBOXTKN','PANWEB'].includes(c.name)).map(c=>({name:c.name,domain:c.domain,host_only:c.hostOnly,source_host:c.sourceHost,value_length:c.value.length,usable_for_pan:(c.hostOnly?c.domain===PAN_ROOT.hostname:PAN_ROOT.hostname===c.domain||PAN_ROOT.hostname.endsWith('.'+c.domain))&&pathMatches(PAN_ROOT.pathname,c.path)}));}
+async function requestBaidu(input:string|URL,fetcher:typeof fetch,{jar,timeout=10000,parent,maxRequests=4,diagnostics,stopOnCookies=false}:{jar?:BaiduCookieJar;timeout?:number;parent?:AbortSignal;maxRequests?:number;diagnostics?:string;stopOnCookies?:boolean}={}):Promise<BaiduResponse>{
  let url=approvedUrl(String(input));const signal=requestSignal(timeout,parent);
  for(let count=0;count<maxRequests;count++){
   // One deadline covers the complete redirect chain and final response body.
   if(signal.aborted)throw new DOMException('Request canceled','AbortError');
+  const route=url.pathname.endsWith('/qrbdusslogin')?'callback':url.hostname==='pan.baidu.com'?'netdisk':'passport_other';
+  const requestStarted=Date.now();
+  qrDebug(diagnostics,'request',{hop:count,host:url.hostname,route,cookies:jar?cookieShape(jar):[]});
   const cookie=jar?.header(url)||'';const response=await fetcher(url.toString(),{redirect:'manual',headers:{'User-Agent':BROWSER_UA,Referer:PAN_ROOT.toString(),...(cookie?{Cookie:cookie}:{})},signal});
   try{jar?.collect(response,url);}catch(error){await response.body?.cancel();throw error;}
-  if(response.status>=300&&response.status<400){const location=response.headers.get('Location');await response.body?.cancel();if(!location)throw upstreamError('百度登录重定向缺少目标地址');url=approvedUrl(location,url);continue;}
+  const declared=response.headers.get('Content-Length'),contentType=response.headers.get('Content-Type')||'';
+  qrDebug(diagnostics,'response',{hop:count,host:url.hostname,route,http_status:response.status,elapsed_ms:Date.now()-requestStarted,redirect:response.status>=300&&response.status<400,content_kind:contentType.includes('json')?'json':contentType.includes('html')?'html':'other',declared_bytes:declared!==null&&/^\d{1,12}$/.test(declared)?Number(declared):undefined,cookies:jar?cookieShape(jar):[]});
+  if(response.status>=300&&response.status<400){
+   const location=response.headers.get('Location');await response.body?.cancel();if(!location)throw upstreamError('百度登录重定向缺少目标地址');const next=approvedUrl(location,url);
+   // Netdisk can issue STOKEN on a redirect and keep redirecting afterwards.
+   // End credential collection here; account binding still verifies the UID.
+   if(stopOnCookies&&jar?.value('BDUSS',PAN_ROOT)&&jar.value('STOKEN',PAN_ROOT)){
+    qrDebug(diagnostics,'redirect_cookies_ready',{hop:count,host:url.hostname});
+    return {response,url,signal,cookiesReady:true};
+   }
+   url=next;continue;
+  }
   return {response,url,signal};
  }
  throw upstreamError('百度登录重定向次数超过限制');
@@ -111,27 +139,28 @@ function safeError(error:unknown,message:string,parent?:AbortSignal):never{
  throw upstreamError(message);
 }
 export function baiduAuthUrl(sign:string){return `https://wappass.baidu.com/wp/?qrlogin&t=${Math.ceil(Date.now()/1000)}&error=0&sign=${encodeURIComponent(opaqueToken(sign,512))}&cmd=login&lp=pc&tpl=netdisk&adapter=3&qrloginfrom=pc`;}
-export async function baiduQrStart(fetcher:typeof fetch=fetch,parent?:AbortSignal):Promise<{sign:string;qr:string}>{
+export async function baiduQrStart(fetcher:typeof fetch=fetch,parent?:AbortSignal):Promise<{sign:string;qr:string;cookies:StoredCookie[]}>{
  try{
-  const first=await requestBaidu('https://passport.baidu.com/v2/api/getqrcode?lp=pc&qrloginfrom=pc&tpl=netdisk',fetcher,{parent});
+  const jar=new BaiduCookieJar();
+  const first=await requestBaidu('https://passport.baidu.com/v2/api/getqrcode?lp=pc&qrloginfrom=pc&tpl=netdisk',fetcher,{parent,jar});
   if(!first.response.ok){await first.response.body?.cancel();throw upstreamError('百度二维码接口暂不可用，请改用 Cookie 导入');}
   const data=parseCallback(await boundedBody(first.response,32768,first.signal));if(data?.errno!==0||!data?.imgurl)throw upstreamError('百度二维码接口返回异常');
   const sign=opaqueToken(data.sign,512),raw=String(data.imgurl);
   const source=raw.startsWith('//')?'https:'+raw:/^[A-Za-z0-9.-]+\.baidu\.com\//.test(raw)?'https://'+raw:raw;
   const imageUrl=approvedUrl(source,first.url);
-  const image=await requestBaidu(imageUrl,fetcher,{parent});
+  const image=await requestBaidu(imageUrl,fetcher,{parent,jar});
   if(!image.response.ok){await image.response.body?.cancel();throw upstreamError('二维码图片获取失败');}
   const type=(image.response.headers.get('Content-Type')||'').split(';')[0].trim().toLowerCase();
   if(!IMAGE_TYPES.has(type)){await image.response.body?.cancel();throw upstreamError('二维码图片格式不受支持');}
   const bytes=await boundedBytes(image.response,IMAGE_LIMIT,image.signal);
   if(!bytes.length||!imageSignature(type,bytes))throw upstreamError('二维码图片内容无效');
-  return {sign,qr:`data:${type};base64,${bytesToBase64(bytes)}`};
+  return {sign,qr:`data:${type};base64,${bytesToBase64(bytes)}`,cookies:jar.snapshot()};
  }catch(error){return safeError(error,'二维码获取失败，请稍后重试或改用 Cookie 导入',parent);}
 }
-export async function baiduQrPoll(sign:string,fetcher:typeof fetch=fetch,parent?:AbortSignal):Promise<{status:number;v?:string}>{
+export async function baiduQrPoll(sign:string,fetcher:typeof fetch=fetch,parent?:AbortSignal,jar=new BaiduCookieJar()):Promise<{status:number;v?:string}>{
  try{
   const ticket=opaqueToken(sign,512);
-  const result=await requestBaidu(`https://passport.baidu.com/channel/unicast?channel_id=${encodeURIComponent(ticket)}&callback=this_is_callback&tpl=netdisk`,fetcher,{timeout:32000,parent});
+  const result=await requestBaidu(`https://passport.baidu.com/channel/unicast?channel_id=${encodeURIComponent(ticket)}&callback=this_is_callback&tpl=netdisk`,fetcher,{timeout:32000,parent,jar});
   if(!result.response.ok){await result.response.body?.cancel();return {status:0};}
   const payload=parseCallback(await boundedBody(result.response,16384,result.signal));if(payload?.errno!==0)return {status:0};
   let channel=payload.channel_v;if(typeof channel==='string'){try{channel=JSON.parse(channel);}catch{return {status:0};}}
@@ -139,26 +168,50 @@ export async function baiduQrPoll(sign:string,fetcher:typeof fetch=fetch,parent?
   return {status,...(typeof channel.v==='string'?{v:opaqueToken(channel.v)}:{})};
  }catch(error){if(parent?.aborted)throw new DOMException('Request canceled','AbortError');return {status:0};}
 }
-export async function baiduQrCookie(bduss:string,fetcher:typeof fetch=fetch,parent?:AbortSignal):Promise<string>{
+export async function baiduQrCookie(bduss:string,fetcher:typeof fetch=fetch,parent?:AbortSignal,jar=new BaiduCookieJar(),diagnostics?:string):Promise<string>{
+ let stage:'CALLBACK'|'CALLBACK_BODY'|'NETDISK'='CALLBACK',httpStatus:number|undefined,upstreamCode:number|undefined;
+ const started=Date.now();
+ // A relay adds a round trip per redirect. Keep each chain bounded while
+ // leaving room for polling and UID verification inside the 120-second lease.
+ const exchangeDeadline=requestSignal(45000,parent);
  try{
-  const ticket=opaqueToken(bduss),target=encodeURIComponent(PAN_ROOT.toString()),now=Date.now(),jar=new BaiduCookieJar();
+  const ticket=opaqueToken(bduss),target=encodeURIComponent(PAN_ROOT.toString()),now=Date.now();
+  qrDebug(diagnostics,'exchange_start',{cookies:cookieShape(jar)});
   const initial=`https://passport.baidu.com/v3/login/main/qrbdusslogin?v=${now}&bduss=${encodeURIComponent(ticket)}&u=${target}&loginVersion=v4&qrcode=1&tpl=netdisk&apiver=v3&tt=${now}&time=${Math.floor(now/1000)}&alg=v3&callback=bd__cbs__login`;
-  const login=await requestBaidu(initial,fetcher,{jar,parent});
-  if(!login.response.ok){await login.response.body?.cancel();throw upstreamError('百度登录回调暂不可用');}
-  const parsed=parseCallback(await boundedBody(login.response,16384,login.signal)),session=parsed?.data?.session;
+  const login=await requestBaidu(initial,fetcher,{jar,parent:exchangeDeadline,timeout:30000,diagnostics,stopOnCookies:true});
+  httpStatus=login.response.status;
+  if(!login.response.ok&&!login.cookiesReady){await login.response.body?.cancel();throw new BaiduQrError('BAIDU_QR_CALLBACK_HTTP','百度登录回调暂不可用');}
+  // Redirects may finish on a large Netdisk HTML page. Cookies have already
+  // been collected at every hop; only read a passport body for BDUSS fallback.
+  let session:any;
+  if(!jar.value('BDUSS',PAN_ROOT)&&['passport.baidu.com','wappass.baidu.com'].includes(login.url.hostname)){
+   stage='CALLBACK_BODY';
+   const parsed=parseCallback(await boundedBody(login.response,16384,login.signal));session=parsed?.data?.session;
+   const code=parsed?.errInfo?.no??parsed?.errno??parsed?.data?.errno;
+   if((typeof code==='number'||typeof code==='string'&&/^-?\d{1,10}$/.test(code))&&Number.isSafeInteger(Number(code)))upstreamCode=Number(code);
+   qrDebug(diagnostics,'callback_body',{parsed:!!parsed,has_session:!!session,upstream_code:upstreamCode});
+  }else await login.response.body?.cancel();
   // Passport session.stoken is not a Netdisk STOKEN and is intentionally ignored.
   for(const [name,key] of [['BDUSS','bduss'],['PTOKEN','ptoken']] as const){const value=session?.[key];if(!jar.value(name,PAN_ROOT)&&typeof value==='string')jar.setPassportSession(name,opaqueToken(value),login.url);}
-  if(!jar.value('BDUSS',PAN_ROOT))throw upstreamError('百度登录未返回适用于网盘的登录态，请改用 Cookie 导入');
-  if(!jar.value('STOKEN',PAN_ROOT,'pan.baidu.com')){
-   const pan=await requestBaidu(new URL('/disk/home',PAN_ROOT),fetcher,{jar,parent});
+  if(!jar.value('BDUSS',PAN_ROOT))throw new BaiduQrError('BAIDU_QR_BDUSS_MISSING','百度登录回调未返回网盘登录态，请重新扫码');
+  if(!jar.value('STOKEN',PAN_ROOT)){
+   stage='NETDISK';httpStatus=undefined;
+   const pan=await requestBaidu(new URL('/disk/home',PAN_ROOT),fetcher,{jar,parent:exchangeDeadline,timeout:30000,diagnostics,stopOnCookies:true});
+   httpStatus=pan.response.status;
    // Only bounded headers/cookies are needed; do not download the HTML page.
    await pan.response.body?.cancel();
-   if(!pan.response.ok)throw upstreamError('百度网盘登录态获取失败，请重新扫码');
+   if(!pan.response.ok&&!pan.cookiesReady)throw new BaiduQrError('BAIDU_QR_NETDISK_HTTP','百度网盘登录态获取失败，请重新扫码');
   }
-  const stoken=jar.value('STOKEN',PAN_ROOT,'pan.baidu.com');
-  if(!stoken)throw new HttpError(422,'UPSTREAM_COOKIE_INCOMPLETE','百度扫码登录未返回网盘 STOKEN，请改用完整 Cookie 导入');
-  const values=new Map<string,string>();values.set('BDUSS',jar.value('BDUSS',PAN_ROOT));values.set('STOKEN',stoken);
-  for(const name of ['PTOKEN','BAIDUCUID','PANWEB']){const value=jar.value(name,PAN_ROOT);if(value)values.set(name,value);}
-  const result=[...values].map(([name,value])=>`${name}=${value}`).join('; ');if(result.length>16000)throw upstreamError('百度登录 Cookie 超过允许大小');return result;
- }catch(error){return safeError(error,'百度登录回调失败，请重新扫码或改用 Cookie 导入',parent);}
+  const stoken=jar.value('STOKEN',PAN_ROOT);
+  if(!stoken)throw new BaiduQrError('BAIDU_QR_STOKEN_MISSING','百度扫码登录未返回网盘 STOKEN，请改用完整 Cookie 导入',422);
+  qrDebug(diagnostics,'exchange_complete',{elapsed_ms:Date.now()-started,cookies:cookieShape(jar)});
+  return jar.header(PAN_ROOT);
+ }catch(error){
+  if(parent?.aborted)throw new DOMException('Request canceled','AbortError');
+  const reason=error instanceof BaiduQrError?error.code:`BAIDU_QR_${stage}_${error instanceof HttpError?'RESPONSE':error instanceof Error&&['TimeoutError','AbortError'].includes(error.name)?'TIMEOUT':'NETWORK'}`;
+  // Fixed fields only: never log URLs, callback bodies, token values or errors.
+  qrDebug(diagnostics,'exchange_failed',{stage,reason,http_status:httpStatus,upstream_code:upstreamCode,elapsed_ms:Date.now()-started,has_bduss:!!jar.value('BDUSS',PAN_ROOT),has_stoken:!!jar.value('STOKEN',PAN_ROOT)});
+  if(error instanceof BaiduQrError)throw error;
+  throw new BaiduQrError(reason,error instanceof HttpError?error.detail:stage==='NETDISK'?'访问百度网盘时连接失败或超时，请重新扫码':'百度登录回调连接失败或超时，请重新扫码');
+ }
 }

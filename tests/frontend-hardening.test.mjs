@@ -9,7 +9,7 @@ const source=readFileSync(new URL('../web/src/App.vue',import.meta.url),'utf8');
 const script=source.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1].replace(/^import .*$/gm,'');
 function ui(fetcher=async()=>{throw new Error('Unexpected request');}){
  const scope=effectScope(),timers=new Map(),requests=[];let timerId=0,now=Date.now();
- const hooks=`globalThis.ui={auth,passwordForm,logged,ready,me,recovery,busy,screen,activePlatform,platformDetail,platformForm,cookieFields,accountLabel,editingAccountId,restoreAccount,qr,channelForm,channelAdvanced,editingChannel,selectedRun,invites,newInviteCode,users,channels,reviewRuns,resolveForm,resolution,api,logout,loginPassword,changePassword,resetPrivateState,applyGroup,savePlatform,editPlatformAccount,addPlatformAccount,startQr,pollQr,cancelQr,editChannel,createChannel,showRun,openResolution,resolveRun,setApi:(fn)=>{api=fn},setRefresh:(fn)=>{refresh=fn},setLoadPlatform:(fn)=>{loadPlatform=fn},setRefreshSecurity:(fn)=>{refreshSecurity=fn}};`;
+ const hooks=`globalThis.ui={error,auth,passwordForm,logged,ready,me,recovery,busy,screen,activePlatform,platformDetail,platformForm,cookieFields,accountLabel,editingAccountId,restoreAccount,qr,channelForm,channelAdvanced,editingChannel,selectedRun,invites,newInviteCode,users,channels,reviewRuns,resolveForm,resolution,api,logout,loginPassword,changePassword,resetPrivateState,applyGroup,savePlatform,editPlatformAccount,addPlatformAccount,startQr,pollQr,cancelQr,editChannel,createChannel,showRun,openResolution,resolveRun,setApi:(fn)=>{api=fn},setRefresh:(fn)=>{refresh=fn},setLoadPlatform:(fn)=>{loadPlatform=fn},setRefreshSecurity:(fn)=>{refreshSecurity=fn}};`;
  const context={ref,reactive,computed,watch,nextTick,onMounted:()=>{},onBeforeUnmount:()=>{},
   AbortController,DOMException,Response,Headers,TextEncoder,Blob,URL,crypto:globalThis.crypto,
   Date:class extends Date{static now(){return now;}},
@@ -98,6 +98,13 @@ async function startQrFixture(u,handler=async()=>({status:'pending'})){
  const h=u.h;h.logged.value=true;h.screen.value='platform:baidu-netdisk';h.activePlatform.value='baidu-netdisk';h.platformDetail.value={module:{enabled:true},group:{features:['baidu.daily']}};await nextTick();const calls=[];
  h.setApi(async(...args)=>{calls.push(args);if(args[0].endsWith('/qr/start'))return {id:'qr-1',qr:'data:image/png;base64,AA==',expires_at:Date.now()+180000};return handler(...args);});await h.startQr();return calls;
 }
+
+test('Bilibili QR stays on its platform and refresh token is submitted once then cleared',async()=>{
+ const u=ui();try{const h=u.h,calls=[];h.logged.value=true;h.screen.value='platform:bilibili-vip';h.activePlatform.value='bilibili-vip';h.platformDetail.value={module:{enabled:true},group:{features:['bili.vip_claim']}};await nextTick();
+ h.setApi(async(...args)=>{calls.push(args);return args[0].endsWith('/qr/start')?{id:'bili-qr',qr:'data:image/svg+xml;base64,AA==',expires_at:Date.now()+180000}:{status:'pending'};});await h.startQr();await h.pollQr();assert.equal(calls[0][0],'/api/v1/platforms/bilibili-vip/qr/start');assert.equal(calls[1][0],'/api/v1/platforms/bilibili-vip/qr/bili-qr/poll');h.cancelQr();
+ h.setRefresh(async()=>{});h.cookieFields.SESSDATA='synthetic-session';h.cookieFields.bili_jct='synthetic-csrf';h.cookieFields.refresh_token='synthetic-refresh-token';await h.addPlatformAccount();assert.equal(calls[2][2].credentials.refresh_token,'synthetic-refresh-token');assert.equal(h.cookieFields.refresh_token,'');
+ }finally{await u.close();}
+});
 test('QR polling runs independently of the global busy lock and has a bounded deadline',async()=>{
  const u=ui();try{u.h.busy.value=true;const calls=await startQrFixture(u);await u.h.pollQr();assert.equal(calls.length,2);assert.equal(u.h.busy.value,true);assert.ok(u.h.qr.timer);u.advance(181000);await u.h.pollQr();assert.equal(calls.length,2);assert.equal(u.h.qr.id,'');assert.match(u.h.qr.status,/过期/);}finally{await u.close();}
 });
@@ -115,4 +122,8 @@ test('QR reauthentication pins the intended existing account when the challenge 
  h.setApi(async(...args)=>{calls.push(args);return args[0].endsWith('/start')?{id:'qr-2',qr:'data:image/png;base64,AA==',expires_at:Date.now()+180000}:{status:'processing',retry_after_ms:6000};});
  await h.startQr();assert.equal(calls[0][2].accountId,'existing-account');assert.equal(calls[0][2].resumeJobs,true);h.editingAccountId.value='another-account';await h.pollQr();assert.equal(Object.hasOwn(calls[1][2],'accountId'),false);assert.equal(h.qr.accountId,'existing-account');assert.equal(u.timers.get(h.qr.timer).delay,6000);
  }finally{await u.close();}
+});
+
+test('terminal Baidu exchange errors stop polling and show the specific failure',async()=>{
+ const u=ui();try{const calls=await startQrFixture(u,async()=>{throw Object.assign(new Error('百度登录回调未返回网盘登录态，请重新扫码'),{code:'BAIDU_QR_BDUSS_MISSING',status:502});});await u.h.pollQr();assert.equal(u.h.qr.id,'');assert.equal(u.h.qr.timer,0);assert.match(u.h.error.value,/未返回网盘登录态/);assert.equal(calls.length,2);}finally{await u.close();}
 });

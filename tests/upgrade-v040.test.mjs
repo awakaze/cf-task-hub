@@ -20,7 +20,7 @@ test('v0.3 to v0.4 migrations preserve credentials, identities, consent and unre
  await DB.prepare("INSERT INTO outbox(id,owner_user_id,kind,ref_id,payload_json,status,next_attempt_at,updated_at) VALUES('intent','owner','run','pending','{}','sent',?,?)").bind(now,now).run();
  await DB.prepare("INSERT INTO login_challenges(id,owner_user_id,module_id,sign,status,created_at,expires_at,consumed_at) VALUES('old-false-success','owner','baidu-netdisk','synthetic-sign','consumed',?,?,?)").bind(now,now+60000,now).run();
  for(const name of files.filter(n=>n>='0005'))DB.sqlite.exec(readFileSync(new URL(name,directory),'utf8'));
- assert.equal((await DB.prepare("SELECT value_json FROM system_settings WHERE key='schema_version'").first()).value_json,'8');
+ assert.equal((await DB.prepare("SELECT value_json FROM system_settings WHERE key='schema_version'").first()).value_json,'9');
  const user=await DB.prepare("SELECT * FROM users WHERE id='owner'").first();assert.equal(user.password_hash,'legacy-password-hash');assert.equal(user.status,'active');
  const account=await DB.prepare("SELECT * FROM accounts WHERE id='account'").first();
  assert.equal(account.credentials_enc,'unchanged-original-ciphertext');assert.equal(account.fingerprint,'stable-original-fingerprint');assert.equal(account.enabled,1);assert.equal(account.identity_verified_at,now);

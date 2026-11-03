@@ -243,3 +243,52 @@ test('a misleading short Content-Length cannot bypass the streamed 64 KiB body l
  assert.equal(response.status,413,text);assert.ok(Buffer.byteLength(text)<1024);assert.equal(f.DB.calls,0);
  assert.equal(f.DB.sqlite.prepare("SELECT timezone FROM users WHERE id='alice'").get().timezone,'Asia/Shanghai');
 });
+
+test('Baidu QR keeps its cookie session encrypted across HTTP polls and consumes it on binding',async t=>{
+ const f=await setup(t);let polls=0;
+ t.mock.method(globalThis,'fetch',async(input,init)=>{
+  const url=new URL(String(input)),cookie=new Headers(init?.headers).get('Cookie')||'';
+  if(url.pathname.endsWith('getqrcode'))return Response.json({errno:0,sign:'private-qr-sign',imgurl:'https://passport.baidu.com/qr.png'},{headers:{'Set-Cookie':'BAIDUID=private-device; Domain=.baidu.com; Path=/; Secure'}});
+  assert.match(cookie,/BAIDUID=private-device/);
+  if(url.pathname==='/qr.png')return new Response(new Uint8Array([137,80,78,71,13,10,26,10]),{headers:{'Content-Type':'image/png'}});
+  if(url.pathname==='/channel/unicast'){
+   polls++;
+   if(polls===1)return Response.json({errno:0,channel_v:{status:1}},{headers:{'Set-Cookie':'SBOXTKN=private-box; Domain=.baidu.com; Path=/; Secure'}});
+   assert.match(cookie,/SBOXTKN=private-box/);return Response.json({errno:0,channel_v:{status:0,v:'private-ticket'}});
+  }
+  if(url.pathname.endsWith('qrbdusslogin')){assert.match(cookie,/SBOXTKN=private-box/);return new Response('{}',{headers:{'Set-Cookie':'BDUSS=private-login; Domain=.baidu.com; Path=/; Secure, STOKEN=private-stoken; Domain=.baidu.com; Path=/; Secure'}});}
+  if(url.pathname==='/api/loginStatus'){assert.match(cookie,/BDUSS=private-login/);assert.match(cookie,/STOKEN=private-stoken/);return Response.json({errno:0,login_info:{uk:1234}});}
+  throw new Error('Unexpected upstream request');
+ });
+ const started=await status(await f.request(baidu+'/qr/start',{method:'POST',body:{}}),200);
+ assert.doesNotMatch(JSON.stringify(started),/private-device|private-box|cookies|enc:/);
+ const stored=challengeRow(f,started.id);assert.match(stored.sign,/^enc:/);assert.doesNotMatch(stored.sign,/private-/);
+ const session=await decrypt(f.env.DATA_KEY,'alice','qr:'+started.id,stored.sign.slice(4));assert.equal(session.sign,'private-qr-sign');
+ await assert.rejects(decrypt(f.env.DATA_KEY,'bob','qr:'+started.id,stored.sign.slice(4)));
+ const pending=await status(await f.request(`${baidu}/qr/${started.id}/poll`,{method:'POST',body:{}}),200);assert.equal(pending.status,'scanned');
+ const updated=challengeRow(f,started.id);assert.notEqual(updated.sign,stored.sign);assert.doesNotMatch(updated.sign,/private-box/);
+ await f.DB.prepare('UPDATE login_challenges SET next_poll_at=0 WHERE id=?').bind(started.id).run();
+ const confirmed=await status(await f.request(`${baidu}/qr/${started.id}/poll`,{method:'POST',body:{}}),200);assert.equal(confirmed.status,'confirmed');
+ assert.equal(challengeRow(f,started.id).sign,'');assert.doesNotMatch(JSON.stringify(confirmed),/private-/);
+ const a=await f.DB.prepare('SELECT credentials_enc FROM accounts WHERE id=?').bind(confirmed.account_id).first();
+ const creds=await decrypt(f.env.DATA_KEY,'alice',confirmed.account_id,a.credentials_enc);
+ for(const pair of ['BAIDUID=private-device','SBOXTKN=private-box','BDUSS=private-login','STOKEN=private-stoken'])assert.ok(creds.cookie.includes(pair));
+});
+
+test('Baidu poll reads the latest session at lease acquisition rather than a stale initial read',async t=>{
+ const f=await setup(t),id=await challenge(f);
+ const fresh=await encrypt(f.env.DATA_KEY,'alice','qr:'+id,{sign:'fresh-sign',cookies:[]});
+ const prepare=f.DB.prepare.bind(f.DB);
+ t.mock.method(f.DB,'prepare',function(sql){
+  const statement=prepare(sql);
+  if(sql.startsWith('SELECT * FROM login_challenges WHERE id=')){
+   const first=statement.first;
+   statement.first=async function(...args){const stale=await first.apply(this,args);await prepare('UPDATE login_challenges SET sign=? WHERE id=?').bind('enc:'+fresh,id).run();return stale;};
+  }
+  return statement;
+ });
+ t.mock.method(globalThis,'fetch',async input=>{assert.equal(new URL(String(input)).searchParams.get('channel_id'),'fresh-sign');return Response.json({errno:1});});
+ await status(await f.request(`${baidu}/qr/${id}/poll`,{method:'POST',body:{}}),200);
+ const saved=challengeRow(f,id);
+ assert.equal((await decrypt(f.env.DATA_KEY,'alice','qr:'+id,saved.sign.slice(4))).sign,'fresh-sign');
+});

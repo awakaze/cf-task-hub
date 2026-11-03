@@ -7,6 +7,7 @@ import {encrypt,decrypt,sha256} from '../core/crypto.ts';
 import {audit,checkLimit,quotas,getAccount,setting} from '../core/db.ts';
 import {manifests,taskMatches,taskManifest,moduleDefinition,validateModuleSettings} from '../core/registry.ts';
 import {DEFAULT_POLICY} from '../core/notifications.ts';
+import {publicRun} from '../core/run-presentation.ts';
 import {validateSchedule,nextSchedule,validZone} from '../core/time.ts';
 import {verifiedIdentity} from '../core/identity.ts';
 import {upstreamFetch} from '../core/upstream-fetch.ts';
@@ -15,14 +16,15 @@ import {noUnsettled,requireRunning,takeRate,sanitizeReport} from '../core/safety
 import {validateChannelInput,sendTestNotification} from '../providers/notify.ts';
 import {queueRun} from '../core/scheduler.ts';
 import {manualRunUsage} from '../core/run-batch.ts';
+import {biliSessionStatements,credentialMutationGuard} from '../core/bilibili-sessions.ts';
 
 type AppContext={Bindings:Env;Variables:{user:CurrentUser}};
 type App=Hono<AppContext>;
-const accountSchema=z.object({module_id:z.enum(['baidu-netdisk','bilibili-vip']),label:z.string().min(1).max(50),credentials:z.object({cookie:z.string().min(10).max(16000),cuid:z.string().max(500).optional(),headers:z.record(z.string(),z.string().max(500).refine(v=>!/[\r\n]/.test(v))).refine(h=>Object.keys(h).length<=2&&Object.keys(h).every(k=>['user-agent','x-requested-with'].includes(k.toLowerCase())),'Only User-Agent and X-Requested-With are allowed').optional()}),config:z.record(z.string(),z.unknown()).default({})});
+const accountSchema=z.object({module_id:z.enum(['baidu-netdisk','bilibili-vip']),label:z.string().min(1).max(50),credentials:z.object({cookie:z.string().min(10).max(16000),refresh_token:z.string().min(1).max(4096).regex(/^[A-Za-z0-9._~-]+$/).optional(),cuid:z.string().max(500).optional(),headers:z.record(z.string(),z.string().max(500).refine(v=>!/[\r\n]/.test(v))).refine(h=>Object.keys(h).length<=2&&Object.keys(h).every(k=>['user-agent','x-requested-with'].includes(k.toLowerCase())),'Only User-Agent and X-Requested-With are allowed').optional()}),config:z.record(z.string(),z.unknown()).default({})});
 const scheduleSchema=z.unknown().transform((value,ctx)=>{try{return validateSchedule(value);}catch{ctx.addIssue({code:'custom',message:'Invalid daily, weekly or interval schedule'});return z.NEVER;}});
 const jobSchema=z.object({account_id:z.string().uuid(),task_key:z.string().min(3),schedule:scheduleSchema,enabled:z.boolean().default(false)});
 function user(c:Context<AppContext>){return c.get('user') as CurrentUser;}
-function publicAccount(row:Record<string,unknown>){return {id:row.id,module_id:row.module_id,label:row.label,enabled:!!row.enabled,config:jsonSafeParse(String(row.config_json),{}),created_at:row.created_at,identity_verified_at:row.identity_verified_at,has_credentials:true};}
+function publicAccount(row:Record<string,unknown>){return {id:row.id,module_id:row.module_id,label:row.label,enabled:!!row.enabled,config:jsonSafeParse(String(row.config_json),{}),created_at:row.created_at,identity_verified_at:row.identity_verified_at,has_credentials:true,session_status:row.session_status??'manual',last_refreshed_at:row.last_refreshed_at??null};}
 async function taskAllowed(env:Env,module:string,key:string){
  const flags=await setting(env,'modules_enabled',{'baidu-netdisk':true,'bilibili-vip':true});
  assert((flags as any)[module]!==false,403,'MODULE_DISABLED','该模块暂未开放');
@@ -51,10 +53,10 @@ export function registerUserRoutes(app:App){
    c.env.DB.prepare("SELECT count(*) n FROM job_runs WHERE owner_user_id=? AND status IN ('failed','waiting_verification') AND created_at>=?").bind(u.id,Date.now()-86400000),
   ]);
   const recent=await c.env.DB.prepare('SELECT r.id,r.status,r.created_at,r.result_json,r.job_id,j.task_key,a.label account_label FROM job_runs r JOIN jobs j ON j.id=r.job_id JOIN accounts a ON a.id=j.account_id WHERE r.owner_user_id=? ORDER BY r.created_at DESC LIMIT 8').bind(u.id).all();
-  return c.json({stats:values.map(x=>(x.results[0] as any)?.n||0),recent:recent.results.map((x:any)=>({...x,result_json:undefined}))});
+  return c.json({stats:values.map(x=>(x.results[0] as any)?.n||0),recent:recent.results.map((x:any)=>publicRun(x))});
  });
  app.get('/api/v1/accounts',async c=>{
-  const page=pageNumber(c.req.query('page'));const rows=await c.env.DB.prepare('SELECT * FROM accounts WHERE owner_user_id=? ORDER BY created_at DESC,id LIMIT 50 OFFSET ?').bind(user(c).id,page*50).all();return c.json({items:rows.results.map((x:any)=>publicAccount(x)),page,next_page:rows.results.length===50?page+1:null});
+  const page=pageNumber(c.req.query('page'));const rows=await c.env.DB.prepare('SELECT a.*,s.status session_status,s.last_refreshed_at FROM accounts a LEFT JOIN bili_sessions s ON s.account_id=a.id WHERE a.owner_user_id=? ORDER BY a.created_at DESC,a.id LIMIT 50 OFFSET ?').bind(user(c).id,page*50).all();return c.json({items:rows.results.map((x:any)=>publicAccount(x)),page,next_page:rows.results.length===50?page+1:null});
  });
  app.post('/api/v1/accounts',async c=>{
   const u=user(c),body=accountSchema.parse(await c.req.json());
@@ -65,7 +67,7 @@ export function registerUserRoutes(app:App){
   const fetcher=upstreamFetch(c.env);const identity=await verifiedIdentity(c.env,body.module_id,{...body.credentials,cookie},fetcher);
   const fp=identity.fingerprint;
   const encrypted=await encrypt(c.env.DATA_KEY,u.id,id,{...body.credentials,cookie,externalId:identity.externalId});
-  try{await c.env.DB.prepare('INSERT INTO accounts(id,owner_user_id,module_id,label,fingerprint,credentials_enc,config_json,enabled,created_at,updated_at,identity_verified_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)').bind(id,u.id,body.module_id,body.label,fp,encrypted,JSON.stringify(config),1,Date.now(),Date.now(),Date.now()).run();}
+  try{await c.env.DB.batch([c.env.DB.prepare('INSERT INTO accounts(id,owner_user_id,module_id,label,fingerprint,credentials_enc,config_json,enabled,created_at,updated_at,identity_verified_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)').bind(id,u.id,body.module_id,body.label,fp,encrypted,JSON.stringify(config),1,Date.now(),Date.now(),Date.now()),...biliSessionStatements(c.env,body.module_id,id,body.credentials)]);}
   catch {throw new HttpError(409,'ACCOUNT_CONFLICT','账号已被绑定或数据无效');}
   await audit(c.env,u.id,'account.create',id,{module_id:body.module_id});return c.json({id,ok:true},201);
  });
@@ -83,8 +85,10 @@ export function registerUserRoutes(app:App){
    fp=identity.fingerprint;creds=await encrypt(c.env.DATA_KEY,u.id,id,{...input,externalId:identity.externalId});verified=Date.now();
   }
   if(body.enabled===true)assert(verified,409,'REVERIFY_REQUIRED','Re-enter and verify the account credentials before enabling');
+  if(body.enabled===true&&!body.credentials){const session=await c.env.DB.prepare('SELECT status FROM bili_sessions WHERE account_id=?').bind(id).first<{status:string}>();assert(session?.status!=='needs_login',409,'BILI_RELOGIN_REQUIRED','请先重新扫码或导入新的登录凭据，再恢复账号及计划');}
   const config=body.config!==undefined?JSON.stringify(await checkAccountConfig(module,body.config)):String(old.config_json);
-  try{await c.env.DB.prepare('UPDATE accounts SET label=?,enabled=?,credentials_enc=?,fingerprint=?,config_json=?,updated_at=?,identity_verified_at=? WHERE id=? AND owner_user_id=?').bind(body.label??old.label,body.enabled===undefined?old.enabled:body.enabled?1:0,creds,fp,config,Date.now(),verified??null,id,u.id).run();}catch{throw new HttpError(409,'ACCOUNT_CONFLICT','账号可能重复绑定');}
+  const guard=credentialMutationGuard(c.env,old);
+  try{await c.env.DB.batch([guard.before,c.env.DB.prepare('UPDATE accounts SET label=?,enabled=?,credentials_enc=?,fingerprint=?,config_json=?,updated_at=?,identity_verified_at=? WHERE id=? AND owner_user_id=?').bind(body.label??old.label,body.enabled===undefined?old.enabled:body.enabled?1:0,creds,fp,config,Date.now(),verified??null,id,u.id),...(body.credentials?biliSessionStatements(c.env,module,id,body.credentials):[]),guard.after]);}catch{throw new HttpError(409,'ACCOUNT_CONFLICT','账号已更新或正在续期，请刷新页面后重试');}
   await audit(c.env,u.id,'account.update',id);return c.json({ok:true});
  });
  app.delete('/api/v1/accounts/:id',async c=>{
@@ -147,10 +151,10 @@ export function registerUserRoutes(app:App){
  });
  app.get('/api/v1/runs',async c=>{
   const before=cursor(c.req.query('before')),afterId=c.req.query('after_id')||'~';assert(afterId.length<=100,400,'INVALID_CURSOR','Invalid cursor ID');
-  const rows=await c.env.DB.prepare('SELECT r.id,r.job_id,r.status,r.manual,r.created_at,r.started_at,r.finished_at,r.error_code,j.task_key,a.label account_label FROM job_runs r JOIN jobs j ON j.id=r.job_id JOIN accounts a ON a.id=j.account_id WHERE r.owner_user_id=? AND (r.created_at<? OR (r.created_at=? AND r.id<?)) ORDER BY r.created_at DESC,r.id DESC LIMIT 50').bind(user(c).id,before,before,afterId).all();return c.json({items:rows.results,next_before:rows.results.length===50?rows.results[49].created_at:null,next_id:rows.results.length===50?rows.results[49].id:null});
+  const rows=await c.env.DB.prepare('SELECT r.id,r.job_id,r.status,r.manual,r.created_at,r.started_at,r.finished_at,r.error_code,r.result_json,j.task_key,a.label account_label FROM job_runs r JOIN jobs j ON j.id=r.job_id JOIN accounts a ON a.id=j.account_id WHERE r.owner_user_id=? AND (r.created_at<? OR (r.created_at=? AND r.id<?)) ORDER BY r.created_at DESC,r.id DESC LIMIT 50').bind(user(c).id,before,before,afterId).all();return c.json({items:rows.results.map(x=>publicRun(x)),next_before:rows.results.length===50?rows.results[49].created_at:null,next_id:rows.results.length===50?rows.results[49].id:null});
  });
  app.get('/api/v1/runs/:id',async c=>{
-  const r=await c.env.DB.prepare('SELECT * FROM job_runs WHERE id=? AND owner_user_id=?').bind(c.req.param('id'),user(c).id).first<any>();assert(r,404,'NOT_FOUND','记录不存在');const steps=await c.env.DB.prepare('SELECT operation_id,status,report_json,updated_at FROM job_steps WHERE run_id=? AND owner_user_id=? ORDER BY updated_at').bind(r.id,user(c).id).all();return c.json({run:{...r,result:jsonSafeParse(r.result_json,null),result_json:undefined},steps:steps.results.map((s:any)=>({...s,report:jsonSafeParse(s.report_json,{}),report_json:undefined}))});
+  const r=await c.env.DB.prepare('SELECT r.*,j.task_key,a.label account_label FROM job_runs r JOIN jobs j ON j.id=r.job_id JOIN accounts a ON a.id=j.account_id WHERE r.id=? AND r.owner_user_id=?').bind(c.req.param('id'),user(c).id).first<any>();assert(r,404,'NOT_FOUND','记录不存在');const steps=await c.env.DB.prepare('SELECT operation_id,status,report_json,updated_at FROM job_steps WHERE run_id=? AND owner_user_id=? ORDER BY updated_at').bind(r.id,user(c).id).all();return c.json({run:publicRun(r,true),steps:steps.results.map((s:any)=>({...s,report:jsonSafeParse(s.report_json,{}),report_json:undefined}))});
  });
  app.get('/api/v1/notification-channels',async c=>{
   const owner=user(c).id,r=await c.env.DB.prepare('SELECT id,name,type,enabled,created_at,updated_at,consecutive_failures,cooldown_until,config_enc FROM notification_channels WHERE owner_user_id=? ORDER BY created_at DESC LIMIT 20').bind(owner).all<any>();

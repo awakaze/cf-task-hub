@@ -82,6 +82,12 @@ export async function scheduledTick(env:Env):Promise<{scheduled:number;published
 }
 export async function consumeMessage(env:Env,message:QueueItem):Promise<void>{
  if(!message||typeof message.id!=='string'||message.id.length>128)throw new Error('Invalid queue message');
+ if(message.kind==='credential'){
+  const account=await env.DB.prepare("SELECT fingerprint FROM accounts WHERE id=? AND module_id='bilibili-vip'").bind(message.id).first<{fingerprint:string}>();
+  if(!account)return;
+  const response=await env.ACCOUNTS.get(env.ACCOUNTS.idFromName('account:'+account.fingerprint)).fetch('https://internal/refresh',{method:'POST',body:JSON.stringify({accountId:message.id})});
+  if(!response.ok)throw new Error('Session coordinator unavailable');return;
+ }
  if(message.kind==='dispatch'){await scheduledTick(env);return;}
  if(message.kind==='maintenance'){await maintenance(env);return;}
  if(message.kind==='run'){
