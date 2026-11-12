@@ -46,7 +46,7 @@ export async function validateChannelInput(env:Env,type:string,raw:unknown):Prom
 export async function sendNotification(type:string,config:any,event:any,fetcher:typeof fetch=fetch):Promise<void>{
  const msg=notificationText(event),signal=AbortSignal.timeout(10000);
  if(type==='webhook'){
-  const body=JSON.stringify({event_id:event.id,event_type:'task.'+event.event_type,module:event.module_id||null,task:event.task_key||null,account_label:event.account_label||null,status:event.status||null,message:event.summary,occurred_at:new Date(event.created_at).toISOString(),run_url:event.run_url||null});
+  const body=JSON.stringify({title:msg.title,content:msg.text,event_id:event.id,event_type:'task.'+event.event_type,module:event.module_id||null,task:event.task_key||null,account_label:event.account_label||null,status:event.status||null,message:event.summary,occurred_at:new Date(event.created_at).toISOString(),run_url:event.run_url||null});
   const headers:Record<string,string>={...config.headers,'Content-Type':'application/json','X-TaskHub-Event-Id':String(event.id),'X-TaskHub-Timestamp':String(Date.now())};
   if(config.signingSecret){const key=await crypto.subtle.importKey('raw',new TextEncoder().encode(config.signingSecret),{name:'HMAC',hash:'SHA-256'},false,['sign']);
    const sig=new Uint8Array(await crypto.subtle.sign('HMAC',key,new TextEncoder().encode(`${headers['X-TaskHub-Timestamp']}.${body}`)));
@@ -66,11 +66,11 @@ async function reserveBudget(env:Env,owner:string,id:string){
  await env.DB.prepare("INSERT OR IGNORE INTO usage_claims(id,day,owner_user_id,kind,created_at) VALUES(?,?,?,'notification',?)").bind(id,new Date().toISOString().slice(0,10),owner,Date.now()).run();
 }
 export async function sendTestNotification(env:Env,owner:string,channel:any,fetcher:typeof fetch=fetch){
- await requireRunning(env);await takeRate(env,'notify-test:'+owner,3,86400000);
+ await requireRunning(env);await takeRate(env,'notify-test:'+owner,10,86400000);
  const config=await decryptConfig<any>(env,owner,channel.id,channel.config_enc);
- if(channel.type==='webhook')await validateWebhookDns(config.url,await setting<string[]>(env,'webhook_allowed_hosts',[]),fetcher);
+ if(channel.type==='webhook')try{await validateWebhookDns(config.url,await setting<string[]>(env,'webhook_allowed_hosts',[]),fetcher);}catch(error){throw new HttpError(400,'INVALID_WEBHOOK',error instanceof Error?error.message:'Webhook target validation failed');}
  try{await reserveBudget(env,owner,'test:'+crypto.randomUUID());}catch{throw new HttpError(429,'NOTIFICATION_QUOTA','Notification quota exceeded');}
- await sendNotification(channel.type,config,{id:crypto.randomUUID(),event_type:'success',summary:'Notification channel test',created_at:Date.now(),module_id:'system',task_key:'notification.test',account_label:'Test'},fetcher);
+ try{await sendNotification(channel.type,config,{id:crypto.randomUUID(),event_type:'success',summary:'Notification channel test',created_at:Date.now(),module_id:'system',task_key:'notification.test',account_label:'Test'},fetcher);}catch(error){if(error instanceof NotificationError)throw new HttpError(502,'NOTIFY_FAILED',error.message);throw error;}
 }
 function policyFrom(row:any){const error_mode:'same'|'custom'=row.error_mode==='custom'?'custom':'same';return {success_enabled:!!row.success_enabled,exception_enabled:!!row.exception_enabled,success_channels:Array.isArray(row.success_channels)?row.success_channels:[],error_mode,exception_channels:Array.isArray(row.exception_channels)?row.exception_channels:[]};}
 function parsePolicy(raw:string|null|undefined){
